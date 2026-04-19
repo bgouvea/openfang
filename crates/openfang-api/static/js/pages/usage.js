@@ -45,7 +45,7 @@ function analyticsPage() {
       try {
         this.summary = await OpenFangAPI.get('/api/usage/summary');
       } catch(e) {
-        this.summary = { total_input_tokens: 0, total_output_tokens: 0, total_cost_usd: 0, call_count: 0, total_tool_calls: 0 };
+        this.summary = { total_input_tokens: 0, total_cached_input_tokens: 0, total_output_tokens: 0, total_cost_usd: 0, call_count: 0, total_tool_calls: 0 };
         throw e;
       }
     },

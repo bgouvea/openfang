@@ -16,6 +16,8 @@ pub struct UsageRecord {
     pub model: String,
     /// Input tokens consumed.
     pub input_tokens: u64,
+    /// Input tokens satisfied from cache.
+    pub cached_input_tokens: u64,
     /// Output tokens consumed.
     pub output_tokens: u64,
     /// Estimated cost in USD.
@@ -29,6 +31,8 @@ pub struct UsageRecord {
 pub struct UsageSummary {
     /// Total input tokens.
     pub total_input_tokens: u64,
+    /// Total cached input tokens.
+    pub total_cached_input_tokens: u64,
     /// Total output tokens.
     pub total_output_tokens: u64,
     /// Total estimated cost in USD.
@@ -48,6 +52,8 @@ pub struct ModelUsage {
     pub total_cost_usd: f64,
     /// Total input tokens.
     pub total_input_tokens: u64,
+    /// Total cached input tokens.
+    pub total_cached_input_tokens: u64,
     /// Total output tokens.
     pub total_output_tokens: u64,
     /// Number of calls.
@@ -63,6 +69,8 @@ pub struct DailyBreakdown {
     pub cost_usd: f64,
     /// Total tokens (input + output).
     pub tokens: u64,
+    /// Total cached input tokens.
+    pub cached_input_tokens: u64,
     /// Number of API calls.
     pub calls: u64,
 }
@@ -88,14 +96,15 @@ impl UsageStore {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO usage_events (id, agent_id, timestamp, model, input_tokens, output_tokens, cost_usd, tool_calls)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO usage_events (id, agent_id, timestamp, model, input_tokens, cached_input_tokens, output_tokens, cost_usd, tool_calls)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 id,
                 record.agent_id.0.to_string(),
                 now,
                 record.model,
                 record.input_tokens as i64,
+                record.cached_input_tokens as i64,
                 record.output_tokens as i64,
                 record.cost_usd,
                 record.tool_calls as i64,
@@ -199,14 +208,16 @@ impl UsageStore {
 
         let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match agent_id {
             Some(aid) => (
-                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(cost_usd), 0.0), COUNT(*), COALESCE(SUM(tool_calls), 0)
+                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cost_usd), 0.0), COUNT(*),
+                        COALESCE(SUM(tool_calls), 0)
                  FROM usage_events WHERE agent_id = ?1",
                 vec![Box::new(aid.0.to_string())],
             ),
             None => (
-                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(cost_usd), 0.0), COUNT(*), COALESCE(SUM(tool_calls), 0)
+                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cost_usd), 0.0), COUNT(*),
+                        COALESCE(SUM(tool_calls), 0)
                  FROM usage_events",
                 vec![],
             ),
@@ -219,10 +230,11 @@ impl UsageStore {
             .query_row(sql, params_refs.as_slice(), |row| {
                 Ok(UsageSummary {
                     total_input_tokens: row.get::<_, i64>(0)? as u64,
-                    total_output_tokens: row.get::<_, i64>(1)? as u64,
-                    total_cost_usd: row.get(2)?,
-                    call_count: row.get::<_, i64>(3)? as u64,
-                    total_tool_calls: row.get::<_, i64>(4)? as u64,
+                    total_cached_input_tokens: row.get::<_, i64>(1)? as u64,
+                    total_output_tokens: row.get::<_, i64>(2)? as u64,
+                    total_cost_usd: row.get(3)?,
+                    call_count: row.get::<_, i64>(4)? as u64,
+                    total_tool_calls: row.get::<_, i64>(5)? as u64,
                 })
             })
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -240,7 +252,7 @@ impl UsageStore {
         let mut stmt = conn
             .prepare(
                 "SELECT model, COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(input_tokens), 0),
-                        COALESCE(SUM(output_tokens), 0), COUNT(*)
+                        COALESCE(SUM(cached_input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(*)
                  FROM usage_events GROUP BY model ORDER BY SUM(cost_usd) DESC",
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -251,8 +263,9 @@ impl UsageStore {
                     model: row.get(0)?,
                     total_cost_usd: row.get(1)?,
                     total_input_tokens: row.get::<_, i64>(2)? as u64,
-                    total_output_tokens: row.get::<_, i64>(3)? as u64,
-                    call_count: row.get::<_, i64>(4)? as u64,
+                    total_cached_input_tokens: row.get::<_, i64>(3)? as u64,
+                    total_output_tokens: row.get::<_, i64>(4)? as u64,
+                    call_count: row.get::<_, i64>(5)? as u64,
                 })
             })
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -276,6 +289,7 @@ impl UsageStore {
                 "SELECT date(timestamp) as day,
                             COALESCE(SUM(cost_usd), 0.0),
                             COALESCE(SUM(input_tokens) + SUM(output_tokens), 0),
+                            COALESCE(SUM(cached_input_tokens), 0),
                             COUNT(*)
                      FROM usage_events
                      WHERE timestamp > datetime('now', '-{days} days')
@@ -290,7 +304,8 @@ impl UsageStore {
                     date: row.get(0)?,
                     cost_usd: row.get(1)?,
                     tokens: row.get::<_, i64>(2)? as u64,
-                    calls: row.get::<_, i64>(3)? as u64,
+                    cached_input_tokens: row.get::<_, i64>(3)? as u64,
+                    calls: row.get::<_, i64>(4)? as u64,
                 })
             })
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -372,6 +387,7 @@ mod tests {
                 agent_id,
                 model: "claude-haiku".to_string(),
                 input_tokens: 100,
+                cached_input_tokens: 25,
                 output_tokens: 50,
                 cost_usd: 0.001,
                 tool_calls: 2,
@@ -383,6 +399,7 @@ mod tests {
                 agent_id,
                 model: "claude-sonnet".to_string(),
                 input_tokens: 500,
+                cached_input_tokens: 50,
                 output_tokens: 200,
                 cost_usd: 0.01,
                 tool_calls: 1,
@@ -392,6 +409,7 @@ mod tests {
         let summary = store.query_summary(Some(agent_id)).unwrap();
         assert_eq!(summary.call_count, 2);
         assert_eq!(summary.total_input_tokens, 600);
+        assert_eq!(summary.total_cached_input_tokens, 75);
         assert_eq!(summary.total_output_tokens, 250);
         assert!((summary.total_cost_usd - 0.011).abs() < 0.0001);
         assert_eq!(summary.total_tool_calls, 3);
@@ -408,6 +426,7 @@ mod tests {
                 agent_id: a1,
                 model: "haiku".to_string(),
                 input_tokens: 100,
+                cached_input_tokens: 10,
                 output_tokens: 50,
                 cost_usd: 0.001,
                 tool_calls: 0,
@@ -419,6 +438,7 @@ mod tests {
                 agent_id: a2,
                 model: "sonnet".to_string(),
                 input_tokens: 200,
+                cached_input_tokens: 20,
                 output_tokens: 100,
                 cost_usd: 0.005,
                 tool_calls: 1,
@@ -428,6 +448,7 @@ mod tests {
         let summary = store.query_summary(None).unwrap();
         assert_eq!(summary.call_count, 2);
         assert_eq!(summary.total_input_tokens, 300);
+        assert_eq!(summary.total_cached_input_tokens, 30);
     }
 
     #[test]
@@ -441,6 +462,7 @@ mod tests {
                     agent_id,
                     model: "haiku".to_string(),
                     input_tokens: 100,
+                    cached_input_tokens: 5,
                     output_tokens: 50,
                     cost_usd: 0.001,
                     tool_calls: 0,
@@ -453,6 +475,7 @@ mod tests {
                 agent_id,
                 model: "sonnet".to_string(),
                 input_tokens: 500,
+                cached_input_tokens: 25,
                 output_tokens: 200,
                 cost_usd: 0.01,
                 tool_calls: 1,
@@ -465,6 +488,8 @@ mod tests {
         assert_eq!(by_model[0].model, "sonnet");
         assert_eq!(by_model[1].model, "haiku");
         assert_eq!(by_model[1].call_count, 3);
+        assert_eq!(by_model[0].total_cached_input_tokens, 25);
+        assert_eq!(by_model[1].total_cached_input_tokens, 15);
     }
 
     #[test]
@@ -477,6 +502,7 @@ mod tests {
                 agent_id,
                 model: "haiku".to_string(),
                 input_tokens: 100,
+                cached_input_tokens: 0,
                 output_tokens: 50,
                 cost_usd: 0.05,
                 tool_calls: 0,
@@ -497,6 +523,7 @@ mod tests {
                 agent_id,
                 model: "haiku".to_string(),
                 input_tokens: 100,
+                cached_input_tokens: 0,
                 output_tokens: 50,
                 cost_usd: 0.123,
                 tool_calls: 0,
@@ -517,6 +544,7 @@ mod tests {
                 agent_id,
                 model: "haiku".to_string(),
                 input_tokens: 100,
+                cached_input_tokens: 0,
                 output_tokens: 50,
                 cost_usd: 0.001,
                 tool_calls: 0,

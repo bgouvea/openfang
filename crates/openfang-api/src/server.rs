@@ -559,12 +559,28 @@ pub async fn build_router(
         )
         // OpenAI Codex OAuth
         .route(
+            "/api/providers/codex/oauth/start",
+            axum::routing::post(routes::codex_oauth_start),
+        )
+        .route(
+            "/api/providers/codex/oauth/poll/{poll_id}",
+            axum::routing::get(routes::codex_oauth_poll),
+        )
+        .route(
+            "/api/providers/codex/oauth/callback",
+            axum::routing::get(routes::codex_oauth_callback),
+        )
+        .route(
             "/api/providers/openai-codex/oauth/start",
-            axum::routing::post(routes::openai_codex_oauth_start),
+            axum::routing::post(routes::codex_oauth_start),
         )
         .route(
             "/api/providers/openai-codex/oauth/poll/{poll_id}",
-            axum::routing::get(routes::openai_codex_oauth_poll),
+            axum::routing::get(routes::codex_oauth_poll),
+        )
+        .route(
+            "/api/providers/openai-codex/oauth/callback",
+            axum::routing::get(routes::codex_oauth_callback),
         )
         // Gemini OAuth
         .route(

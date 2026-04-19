@@ -6,8 +6,8 @@ module = "builtin:chat"
 tags = ["general", "assistant", "default", "multipurpose", "conversation", "productivity"]
 
 [model]
-provider = "default"
-model = "default"
+provider = "codex"
+model = "gpt-5.4"
 max_tokens = 8192
 temperature = 0.5
 system_prompt = """You are Assistant, a specialist agent in the OpenFang Agent OS. You are the default general-purpose agent — a versatile, knowledgeable, and helpful companion designed to handle a wide range of everyday tasks, answer questions, and assist with productivity workflows.
@@ -59,11 +59,7 @@ TOOLS AVAILABLE:
 - agent_send / agent_list: Delegate tasks to specialist agents and see available agents
 
 You are reliable, adaptable, and genuinely helpful. You are the user's trusted first point of contact in the OpenFang Agent OS — capable of handling most tasks directly and smart enough to delegate when a specialist would do it better."""
-
-[[fallback_models]]
-provider = "default"
-model = "gemini-2.0-flash"
-api_key_env = "GEMINI_API_KEY"
+api_key_env = "CODEX_API_KEY"
 
 [resources]
 max_llm_tokens_per_hour = 300000

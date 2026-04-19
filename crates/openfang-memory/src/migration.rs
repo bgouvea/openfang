@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -324,6 +328,21 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (8, datetime('now'), 'Add audit_entries table for persistent Merkle audit trail');
         ",
+    )?;
+    Ok(())
+}
+
+/// Version 9: Track cached input tokens in usage_events.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "usage_events", "cached_input_tokens") {
+        conn.execute(
+            "ALTER TABLE usage_events ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (9, datetime('now'), 'Add cached_input_tokens to usage_events')",
+        [],
     )?;
     Ok(())
 }

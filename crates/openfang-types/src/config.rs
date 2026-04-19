@@ -968,6 +968,44 @@ pub enum TypingMode {
 // Gap 7: Thinking level support
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl std::fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        };
+        f.write_str(value)
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            other => Err(format!("Invalid reasoning effort '{other}'")),
+        }
+    }
+}
+
 /// Extended thinking configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -976,6 +1014,8 @@ pub struct ThinkingConfig {
     pub budget_tokens: u32,
     /// Whether to stream thinking tokens to the client.
     pub stream_thinking: bool,
+    /// Provider-specific reasoning effort preset when supported.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Default for ThinkingConfig {
@@ -983,6 +1023,7 @@ impl Default for ThinkingConfig {
         Self {
             budget_tokens: 10_000,
             stream_thinking: false,
+            reasoning_effort: None,
         }
     }
 }

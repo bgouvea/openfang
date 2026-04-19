@@ -159,6 +159,9 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// In-flight message counters per agent. Used by heartbeat to avoid false
+    /// crash detection while an agent is still executing a long request.
+    agent_inflight: dashmap::DashMap<AgentId, usize>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -1157,6 +1160,7 @@ impl OpenFangKernel {
             channel_adapters: dashmap::DashMap::new(),
             default_model_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
+            agent_inflight: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
         };
 
@@ -1588,6 +1592,45 @@ impl OpenFangKernel {
             .await
     }
 
+    /// Send a message to an agent using a temporary isolated session.
+    ///
+    /// This is intended for workflows/orchestrators so they do not reuse the
+    /// agent's interactive chat session and transport continuity state.
+    pub async fn send_message_isolated(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+    ) -> KernelResult<AgentLoopResult> {
+        let temp_session = self
+            .memory
+            .create_session_with_label(agent_id, Some("workflow"))
+            .map_err(KernelError::OpenFang)?;
+
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+
+        let result = self
+            .send_message_with_handle_and_blocks_for_session(
+                agent_id,
+                message,
+                handle,
+                None,
+                None,
+                None,
+                Some(temp_session.id),
+            )
+            .await;
+
+        let continuity_key = format!("codex.previous_response_id.{}", temp_session.id.0);
+        let _ = self.memory.structured_delete(agent_id, &continuity_key);
+        let _ = self.memory.delete_session(temp_session.id);
+
+        result
+    }
+
     /// Send a multimodal message (text + images) to an agent and get a response.
     ///
     /// Used by channel bridges when a user sends a photo — the image is downloaded,
@@ -1652,6 +1695,28 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
+        self.send_message_with_handle_and_blocks_for_session(
+            agent_id,
+            message,
+            kernel_handle,
+            content_blocks,
+            sender_id,
+            sender_name,
+            None,
+        )
+        .await
+    }
+
+    async fn send_message_with_handle_and_blocks_for_session(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        session_override: Option<SessionId>,
+    ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
         // succession (e.g. rapid voice messages via Telegram). Messages for different
@@ -1667,21 +1732,30 @@ impl OpenFangKernel {
         self.scheduler
             .check_quota(agent_id)
             .map_err(KernelError::OpenFang)?;
+        {
+            let mut count = self.agent_inflight.entry(agent_id).or_insert(0);
+            *count += 1;
+        }
 
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
+        let mut effective_entry = entry.clone();
+        if let Some(session_id) = session_override {
+            effective_entry.session_id = session_id;
+        }
 
         // Dispatch based on module type
-        let result = if entry.manifest.module.starts_with("wasm:") {
-            self.execute_wasm_agent(&entry, message, kernel_handle)
+        let result = if effective_entry.manifest.module.starts_with("wasm:") {
+            self.execute_wasm_agent(&effective_entry, message, kernel_handle)
                 .await
-        } else if entry.manifest.module.starts_with("python:") {
-            self.execute_python_agent(&entry, agent_id, message).await
+        } else if effective_entry.manifest.module.starts_with("python:") {
+            self.execute_python_agent(&effective_entry, agent_id, message)
+                .await
         } else {
             // Default: LLM agent loop (builtin:chat or any unrecognized module)
             self.execute_llm_agent(
-                &entry,
+                &effective_entry,
                 agent_id,
                 message,
                 kernel_handle,
@@ -1691,6 +1765,17 @@ impl OpenFangKernel {
             )
             .await
         };
+        let remove_inflight = if let Some(mut count) = self.agent_inflight.get_mut(&agent_id) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            *count == 0
+        } else {
+            false
+        };
+        if remove_inflight {
+            self.agent_inflight.remove(&agent_id);
+        }
 
         match result {
             Ok(result) => {
@@ -2170,6 +2255,7 @@ impl OpenFangKernel {
                             agent_id,
                             model: model.clone(),
                             input_tokens: result.total_usage.input_tokens,
+                            cached_input_tokens: result.total_usage.cached_input_tokens,
                             output_tokens: result.total_usage.output_tokens,
                             cost_usd: cost,
                             tool_calls: result.iterations.saturating_sub(1),
@@ -2291,6 +2377,7 @@ impl OpenFangKernel {
             response,
             total_usage: openfang_types::message::TokenUsage {
                 input_tokens: 0,
+                cached_input_tokens: 0,
                 output_tokens: 0,
             },
             iterations: 1,
@@ -2351,6 +2438,7 @@ impl OpenFangKernel {
             response: result.response,
             total_usage: openfang_types::message::TokenUsage {
                 input_tokens: 0,
+                cached_input_tokens: 0,
                 output_tokens: 0,
             },
             cost_usd: None,
@@ -2616,6 +2704,8 @@ impl OpenFangKernel {
                 temperature: manifest.model.temperature,
                 system: Some(manifest.model.system_prompt.clone()),
                 thinking: None,
+                continuity_key: None,
+                previous_response_id: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
@@ -2722,6 +2812,7 @@ impl OpenFangKernel {
             agent_id,
             model: model.clone(),
             input_tokens: result.total_usage.input_tokens,
+            cached_input_tokens: result.total_usage.cached_input_tokens,
             output_tokens: result.total_usage.output_tokens,
             cost_usd: cost,
             tool_calls: result.iterations.saturating_sub(1),
@@ -3478,6 +3569,7 @@ impl OpenFangKernel {
                 system_prompt: def.agent.system_prompt.clone(),
                 api_key_env: def.agent.api_key_env.clone(),
                 base_url: def.agent.base_url.clone(),
+                reasoning_effort: None,
             },
             capabilities: ManifestCapabilities {
                 tools: def.tools.clone(),
@@ -3954,7 +4046,7 @@ impl OpenFangKernel {
 
         // Message sender: sends to agent and returns (output, in_tokens, out_tokens)
         let send_message = |agent_id: AgentId, message: String| async move {
-            self.send_message(agent_id, &message)
+            self.send_message_isolated(agent_id, &message)
                 .await
                 .map(|r| {
                     (
@@ -4477,6 +4569,21 @@ impl OpenFangKernel {
 
                 let statuses = check_agents(&kernel.registry, &config);
                 for status in &statuses {
+                    let inflight = kernel
+                        .agent_inflight
+                        .get(&status.agent_id)
+                        .map(|count| *count)
+                        .unwrap_or(0);
+                    if inflight > 0 {
+                        debug!(
+                            agent = %status.name,
+                            inflight,
+                            inactive_secs = status.inactive_secs,
+                            "Skipping heartbeat recovery while agent has in-flight work"
+                        );
+                        continue;
+                    }
+
                     // Skip agents in quiet hours (per-agent config)
                     if let Some(entry) = kernel.registry.get(status.agent_id) {
                         if let Some(ref auto_cfg) = entry.manifest.autonomous {
@@ -5393,8 +5500,21 @@ impl OpenFangKernel {
             });
         }
 
-        // Step 3: Add MCP tools (filtered by agent's MCP server allowlist,
-        // then by declared tools).
+        // Step 3: Read per-agent tool allow/block filters before expanding MCP tools.
+        // This matters for MCP because many agents keep generic `capabilities.tools`
+        // but enable concrete MCP tools through the runtime allowlist.
+        let (tool_allowlist, tool_blocklist) = entry
+            .as_ref()
+            .map(|e| {
+                (
+                    e.manifest.tool_allowlist.clone(),
+                    e.manifest.tool_blocklist.clone(),
+                )
+            })
+            .unwrap_or_default();
+
+        // Step 4: Add MCP tools (filtered by agent's MCP server allowlist,
+        // then by declared tools and runtime tool_allowlist).
         if let Ok(mcp_tools) = self.mcp_tools.lock() {
             let mcp_candidates: Vec<ToolDefinition> = if mcp_allowlist.is_empty() {
                 mcp_tools.iter().cloned().collect()
@@ -5414,26 +5534,21 @@ impl OpenFangKernel {
                     .collect()
             };
             for t in mcp_candidates {
-                // If agent declares specific tools, only include matching MCP tools
-                if !tools_unrestricted && !declared_tools.iter().any(|d| d == &t.name) {
+                // If the agent declares specific tools, keep existing behavior.
+                // But also honor the per-agent runtime tool_allowlist, which is exact-name only.
+                let declared_match = declared_tools.iter().any(|d| d == &t.name);
+                let allowlist_match = tool_allowlist
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(&t.name));
+                if !tools_unrestricted && !declared_match && !allowlist_match {
                     continue;
                 }
                 all_tools.push(t);
             }
         }
 
-        // Step 4: Apply per-agent tool_allowlist/tool_blocklist overrides.
+        // Step 5: Apply per-agent tool_allowlist/tool_blocklist overrides.
         // These are separate from capabilities.tools and act as additional filters.
-        let (tool_allowlist, tool_blocklist) = entry
-            .as_ref()
-            .map(|e| {
-                (
-                    e.manifest.tool_allowlist.clone(),
-                    e.manifest.tool_blocklist.clone(),
-                )
-            })
-            .unwrap_or_default();
-
         if !tool_allowlist.is_empty() {
             all_tools.retain(|t| {
                 tool_allowlist
@@ -5449,7 +5564,7 @@ impl OpenFangKernel {
             });
         }
 
-        // Step 5: Remove shell_exec if exec_policy denies it.
+        // Step 6: Remove shell_exec if exec_policy denies it.
         let exec_blocks_shell = entry.as_ref().is_some_and(|e| {
             e.manifest
                 .exec_policy

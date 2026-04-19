@@ -478,6 +478,7 @@ fn convert_response(resp: VertexResponse) -> Result<CompletionResponse, LlmError
         .usage_metadata
         .map(|u| TokenUsage {
             input_tokens: u.prompt_token_count,
+            cached_input_tokens: 0,
             output_tokens: u.candidates_token_count,
         })
         .unwrap_or_default();
@@ -487,6 +488,7 @@ fn convert_response(resp: VertexResponse) -> Result<CompletionResponse, LlmError
         stop_reason,
         tool_calls,
         usage,
+        response_id: None,
     })
 }
 
@@ -687,6 +689,7 @@ impl LlmDriver for VertexAIDriver {
                         if let Some(usage) = resp.usage_metadata {
                             final_usage = Some(TokenUsage {
                                 input_tokens: usage.prompt_token_count,
+                                cached_input_tokens: 0,
                                 output_tokens: usage.candidates_token_count,
                             });
                         }
@@ -720,6 +723,7 @@ impl LlmDriver for VertexAIDriver {
                 stop_reason,
                 tool_calls: final_tool_calls,
                 usage,
+                response_id: None,
             });
         }
 

@@ -9,7 +9,10 @@
 
 use http::{HeaderName, HeaderValue};
 use openfang_types::tool::ToolDefinition;
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ReadResourceRequestParams,
+    Resource, ResourceContents,
+};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use serde::{Deserialize, Serialize};
@@ -173,7 +176,11 @@ impl McpConnection {
             .or_else(|| strip_mcp_prefix(&self.config.name, name).map(|s| s.to_string()))
             .unwrap_or_else(|| name.to_string());
 
-        let args = arguments.as_object().cloned().unwrap_or_default();
+        let args = arguments
+            .as_object()
+            .cloned()
+            .map(sanitize_mcp_args_map)
+            .unwrap_or_default();
 
         debug!(tool = %raw_name, server = %self.config.name, "MCP tool call");
 
@@ -209,6 +216,23 @@ impl McpConnection {
     /// Get the server name.
     pub fn name(&self) -> &str {
         &self.config.name
+    }
+
+    /// List resources exposed by the MCP server.
+    pub async fn list_resources(&self) -> Result<Vec<Resource>, String> {
+        self.client
+            .list_all_resources()
+            .await
+            .map_err(|e| format!("Failed to list MCP resources: {e}"))
+    }
+
+    /// Read a resource exposed by the MCP server.
+    pub async fn read_resource(&self, uri: &str) -> Result<Vec<ResourceContents>, String> {
+        self.client
+            .read_resource(ReadResourceRequestParams::new(uri))
+            .await
+            .map(|result| result.contents)
+            .map_err(|e| format!("Failed to read MCP resource '{uri}': {e}"))
     }
 
     // -- Transport constructors -----------------------------------------------
@@ -532,4 +556,33 @@ mod tests {
             _ => panic!("Expected Http transport"),
         }
     }
+}
+
+fn sanitize_mcp_args_value(value: serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => {
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::String(s))
+            }
+        }
+        serde_json::Value::Array(values) => Some(serde_json::Value::Array(
+            values
+                .into_iter()
+                .filter_map(sanitize_mcp_args_value)
+                .collect(),
+        )),
+        serde_json::Value::Object(map) => Some(serde_json::Value::Object(sanitize_mcp_args_map(map))),
+        other => Some(other),
+    }
+}
+
+fn sanitize_mcp_args_map(
+    map: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    map.into_iter()
+        .filter_map(|(key, value)| sanitize_mcp_args_value(value).map(|sanitized| (key, sanitized)))
+        .collect()
 }

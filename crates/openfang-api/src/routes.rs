@@ -3,8 +3,10 @@
 use crate::types::*;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
+use axum::routing::get;
 use axum::Json;
+use axum::Router;
 use dashmap::DashMap;
 use openfang_channels::bridge::channel_command_specs;
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
@@ -16,8 +18,9 @@ use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::net::TcpListener as StdTcpListener;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// Shared application state.
 ///
@@ -412,6 +415,7 @@ pub async fn send_message(
                 Json(serde_json::json!(MessageResponse {
                     response,
                     input_tokens: result.total_usage.input_tokens,
+                    cached_input_tokens: result.total_usage.cached_input_tokens,
                     output_tokens: result.total_usage.output_tokens,
                     iterations: result.iterations,
                     cost_usd: result.cost_usd,
@@ -1404,6 +1408,7 @@ pub async fn get_agent(
             "model": {
                 "provider": entry.manifest.model.provider,
                 "model": entry.manifest.model.model,
+                "reasoning_effort": entry.manifest.model.reasoning_effort.map(|value| value.to_string()),
             },
             "capabilities": {
                 "tools": entry.manifest.capabilities.tools,
@@ -1506,6 +1511,7 @@ pub async fn send_message_stream(
                             "done": true,
                             "usage": {
                                 "input_tokens": usage.input_tokens,
+                                "cached_input_tokens": usage.cached_input_tokens,
                                 "output_tokens": usage.output_tokens,
                             }
                         }))
@@ -5223,26 +5229,65 @@ pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 /// GET /api/tools — List all tool definitions (built-in + MCP).
 pub async fn list_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    fn tool_to_json(
+        tool: &openfang_types::tool::ToolDefinition,
+        source: Option<&str>,
+    ) -> serde_json::Value {
+        let payload_description = tool
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.get("payload"))
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str());
+        let query_description = tool
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.get("query"))
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str());
+        let examples = tool.input_schema.get("examples").cloned();
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), serde_json::json!(tool.name));
+        obj.insert(
+            "description".to_string(),
+            serde_json::json!(tool.description),
+        );
+        obj.insert(
+            "input_schema".to_string(),
+            serde_json::json!(tool.input_schema),
+        );
+        obj.insert(
+            "payloadDescription".to_string(),
+            payload_description
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "queryDescription".to_string(),
+            query_description
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "examples".to_string(),
+            examples.unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(source) = source {
+            obj.insert("source".to_string(), serde_json::json!(source));
+        }
+        serde_json::Value::Object(obj)
+    }
+
     let mut tools: Vec<serde_json::Value> = builtin_tool_definitions()
         .iter()
-        .map(|t| {
-            serde_json::json!({
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.input_schema,
-            })
-        })
+        .map(|t| tool_to_json(t, Some("builtin")))
         .collect();
 
     // Include MCP tools so they're visible in Settings -> Tools
     if let Ok(mcp_tools) = state.kernel.mcp_tools.lock() {
         for t in mcp_tools.iter() {
-            tools.push(serde_json::json!({
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.input_schema,
-                "source": "mcp",
-            }));
+            tools.push(tool_to_json(t, Some("mcp")));
         }
     }
 
@@ -5284,12 +5329,26 @@ pub async fn usage_stats(State(state): State<Arc<AppState>>) -> impl IntoRespons
         .list()
         .iter()
         .map(|e| {
-            let (tokens, tool_calls) = state.kernel.scheduler.get_usage(e.id).unwrap_or((0, 0));
+            let summary =
+                state
+                    .kernel
+                    .memory
+                    .usage()
+                    .query_summary(Some(e.id))
+                    .unwrap_or(openfang_memory::usage::UsageSummary {
+                        total_input_tokens: 0,
+                        total_cached_input_tokens: 0,
+                        total_output_tokens: 0,
+                        total_cost_usd: 0.0,
+                        call_count: 0,
+                        total_tool_calls: 0,
+                    });
             serde_json::json!({
                 "agent_id": e.id.to_string(),
                 "name": e.name,
-                "total_tokens": tokens,
-                "tool_calls": tool_calls,
+                "total_tokens": summary.total_input_tokens + summary.total_output_tokens,
+                "cached_input_tokens": summary.total_cached_input_tokens,
+                "tool_calls": summary.total_tool_calls,
             })
         })
         .collect();
@@ -5306,6 +5365,7 @@ pub async fn usage_summary(State(state): State<Arc<AppState>>) -> impl IntoRespo
     match state.kernel.memory.usage().query_summary(None) {
         Ok(s) => Json(serde_json::json!({
             "total_input_tokens": s.total_input_tokens,
+            "total_cached_input_tokens": s.total_cached_input_tokens,
             "total_output_tokens": s.total_output_tokens,
             "total_cost_usd": s.total_cost_usd,
             "call_count": s.call_count,
@@ -5313,6 +5373,7 @@ pub async fn usage_summary(State(state): State<Arc<AppState>>) -> impl IntoRespo
         })),
         Err(_) => Json(serde_json::json!({
             "total_input_tokens": 0,
+            "total_cached_input_tokens": 0,
             "total_output_tokens": 0,
             "total_cost_usd": 0.0,
             "call_count": 0,
@@ -5332,6 +5393,7 @@ pub async fn usage_by_model(State(state): State<Arc<AppState>>) -> impl IntoResp
                         "model": m.model,
                         "total_cost_usd": m.total_cost_usd,
                         "total_input_tokens": m.total_input_tokens,
+                        "total_cached_input_tokens": m.total_cached_input_tokens,
                         "total_output_tokens": m.total_output_tokens,
                         "call_count": m.call_count,
                     })
@@ -5357,6 +5419,7 @@ pub async fn usage_daily(State(state): State<Arc<AppState>>) -> impl IntoRespons
                     "date": day.date,
                     "cost_usd": day.cost_usd,
                     "tokens": day.tokens,
+                    "cached_input_tokens": day.cached_input_tokens,
                     "calls": day.calls,
                 })
             })
@@ -6779,8 +6842,111 @@ pub async fn mcp_http(
         tools.extend(mcp_tools.iter().cloned());
     }
 
-    // Check if this is a tools/call that needs real execution
     let method = request["method"].as_str().unwrap_or("");
+    if method == "initialize" {
+        return Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned(),
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {},
+                    "resources": {}
+                },
+                "serverInfo": {
+                    "name": "openfang",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }));
+    }
+
+    if method == "resources/list" {
+        let mut resources = Vec::new();
+        let connections = state.kernel.mcp_connections.lock().await;
+
+        for conn in connections.iter() {
+            match conn.list_resources().await {
+                Ok(server_resources) => {
+                    for resource in server_resources {
+                        let mut value = serde_json::to_value(resource).unwrap_or_default();
+                        if let Some(obj) = value.as_object_mut() {
+                            let meta = obj
+                                .entry("_meta")
+                                .or_insert_with(|| serde_json::json!({}));
+                            if let Some(meta_obj) = meta.as_object_mut() {
+                                meta_obj.insert(
+                                    "openfangServer".to_string(),
+                                    serde_json::json!(conn.name()),
+                                );
+                            }
+                        }
+                        resources.push(value);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(server = %conn.name(), "Failed to list MCP resources: {e}");
+                }
+            }
+        }
+
+        return Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned(),
+            "result": {
+                "resources": resources
+            }
+        }));
+    }
+
+    if method == "resources/read" {
+        let uri = request["params"]["uri"].as_str().unwrap_or("").trim();
+        if uri.is_empty() {
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.get("id").cloned(),
+                "error": {"code": -32602, "message": "Missing required params.uri for resources/read"}
+            }));
+        }
+
+        let connections = state.kernel.mcp_connections.lock().await;
+        for conn in connections.iter() {
+            let listed = match conn.list_resources().await {
+                Ok(resources) => resources,
+                Err(e) => {
+                    tracing::warn!(server = %conn.name(), uri, "Failed to scan MCP resources for read: {e}");
+                    continue;
+                }
+            };
+
+            if !listed.iter().any(|resource| resource.uri == uri) {
+                continue;
+            }
+
+            return match conn.read_resource(uri).await {
+                Ok(contents) => Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.get("id").cloned(),
+                    "result": {
+                        "contents": contents
+                    }
+                })),
+                Err(e) => Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.get("id").cloned(),
+                    "error": {"code": -32603, "message": e}
+                })),
+            };
+        }
+
+        return Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned(),
+            "error": {"code": -32602, "message": format!("Unknown resource URI: {uri}")}
+        }));
+    }
+
+    // Check if this is a tools/call that needs real execution
     if method == "tools/call" {
         let tool_name = request["params"]["name"].as_str().unwrap_or("");
         let arguments = request["params"]
@@ -7574,20 +7740,27 @@ pub async fn delete_provider_key(
         );
     }
 
-    // Remove from vault (best-effort)
-    state.kernel.remove_credential(&env_var);
-
-    // Remove from secrets.env
-    let secrets_path = state.kernel.config.home_dir.join("secrets.env");
-    if let Err(e) = remove_secret_env(&secrets_path, &env_var) {
+    if let Err(e) = clear_runtime_secret(&state, &env_var) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to update secrets.env: {e}")})),
+            Json(serde_json::json!({"error": e})),
         );
     }
 
-    // Remove from process environment
-    std::env::remove_var(&env_var);
+    if name == "codex" || name == "openai-codex" {
+        for secret_name in [
+            "CODEX_OAUTH_ID_TOKEN",
+            "CODEX_OAUTH_ACCESS_TOKEN",
+            "CODEX_OAUTH_REFRESH_TOKEN",
+        ] {
+            if let Err(e) = clear_runtime_secret(&state, secret_name) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e})),
+                );
+            }
+        }
+    }
 
     // Refresh auth detection
     state
@@ -7636,7 +7809,7 @@ pub async fn test_provider(
         }
     };
 
-    let api_key = std::env::var(&env_var).ok();
+    let api_key = resolve_provider_api_key(&state, &name, &env_var);
     // Only require API key for providers that need one (skip local providers like ollama/vllm/lmstudio)
     if key_required && api_key.is_none() && !env_var.is_empty() {
         return (
@@ -7644,6 +7817,11 @@ pub async fn test_provider(
             Json(serde_json::json!({"error": "Provider API key not configured"})),
         );
     }
+
+    let request_model = default_model
+        .strip_prefix(&format!("{name}/"))
+        .unwrap_or(&default_model)
+        .to_string();
 
     // Attempt a lightweight connectivity test
     let start = std::time::Instant::now();
@@ -7662,13 +7840,15 @@ pub async fn test_provider(
         Ok(driver) => {
             // Send a minimal completion request to test connectivity
             let test_req = openfang_runtime::llm_driver::CompletionRequest {
-                model: default_model.clone(),
+                model: request_model,
                 messages: vec![openfang_types::message::Message::user("Hi")],
                 tools: vec![],
                 max_tokens: 1,
                 temperature: 0.0,
                 system: None,
                 thinking: None,
+                continuity_key: None,
+                previous_response_id: None,
             };
             match driver.complete(test_req).await {
                 Ok(_) => {
@@ -7701,6 +7881,68 @@ pub async fn test_provider(
             })),
         ),
     }
+}
+
+fn resolve_provider_api_key(
+    state: &Arc<AppState>,
+    provider: &str,
+    env_var: &str,
+) -> Option<String> {
+    let primary = if env_var.is_empty() {
+        None
+    } else {
+        state
+            .kernel
+            .resolve_credential(env_var)
+            .filter(|v| !v.trim().is_empty())
+    };
+
+    primary.or_else(|| match provider {
+        "gemini" | "google" => state
+            .kernel
+            .resolve_credential("GOOGLE_API_KEY")
+            .filter(|v| !v.trim().is_empty()),
+        "codex" | "openai-codex" => state
+            .kernel
+            .resolve_credential("CODEX_OAUTH_ACCESS_TOKEN")
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                state
+                    .kernel
+                    .resolve_credential("OPENAI_API_KEY")
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .or_else(|| {
+                state
+                    .kernel
+                    .resolve_credential("CODEX_OAUTH_ID_TOKEN")
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .or_else(openfang_runtime::model_catalog::read_codex_credential),
+        _ => None,
+    })
+}
+
+fn persist_runtime_secret(state: &Arc<AppState>, env_var: &str, value: &str) -> Result<(), String> {
+    state.kernel.store_credential(env_var, value);
+
+    let secrets_path = state.kernel.config.home_dir.join("secrets.env");
+    write_secret_env(&secrets_path, env_var, value)
+        .map_err(|e| format!("Failed to write secrets.env: {e}"))?;
+
+    std::env::set_var(env_var, value);
+    Ok(())
+}
+
+fn clear_runtime_secret(state: &Arc<AppState>, env_var: &str) -> Result<(), String> {
+    state.kernel.remove_credential(env_var);
+
+    let secrets_path = state.kernel.config.home_dir.join("secrets.env");
+    remove_secret_env(&secrets_path, env_var)
+        .map_err(|e| format!("Failed to update secrets.env: {e}"))?;
+
+    std::env::remove_var(env_var);
+    Ok(())
 }
 
 /// PUT /api/providers/{name}/url — Set a custom base URL for a provider.
@@ -8772,6 +9014,7 @@ pub struct PatchAgentConfigRequest {
     pub provider: Option<String>,
     pub api_key_env: Option<String>,
     pub base_url: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub fallback_models: Option<Vec<openfang_types::agent::FallbackModel>>,
 }
 
@@ -8850,6 +9093,27 @@ pub async fn patch_agent_config(
             );
         }
     }
+
+    let parsed_reasoning_effort = if let Some(ref value) = req.reasoning_effort {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            Some(None)
+        } else {
+            match trimmed.parse::<openfang_types::config::ReasoningEffort>() {
+                Ok(parsed) => Some(Some(parsed)),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "reasoning_effort must be one of: none, low, medium, high, xhigh"
+                        })),
+                    );
+                }
+            }
+        }
+    } else {
+        None
+    };
 
     // Update name
     if let Some(ref new_name) = req.name {
@@ -8981,6 +9245,20 @@ pub async fn patch_agent_config(
             .kernel
             .registry
             .update_fallback_models(agent_id, fallbacks)
+            .is_err()
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            );
+        }
+    }
+
+    if let Some(reasoning_effort) = parsed_reasoning_effort {
+        if state
+            .kernel
+            .registry
+            .update_reasoning_effort(agent_id, reasoning_effort)
             .is_err()
         {
             return (
@@ -10962,55 +11240,226 @@ pub async fn copilot_oauth_poll(
 
 /// Active Codex OAuth flows, keyed by poll_id.
 static CODEX_FLOWS: LazyLock<DashMap<String, CodexFlowState>> = LazyLock::new(DashMap::new);
+static CODEX_FLOW_STATES: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
+static CODEX_CALLBACK_SHUTDOWN: LazyLock<Mutex<Option<Arc<tokio::sync::Notify>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[derive(Clone)]
+enum CodexFlowStatus {
+    Pending,
+    Complete,
+    Error(String),
+}
 
 struct CodexFlowState {
-    device_code: String,
+    oauth_state: String,
+    code_verifier: String,
+    redirect_uri: String,
     interval: u64,
     expires_at: Instant,
+    status: CodexFlowStatus,
 }
 
-/// POST /api/providers/openai-codex/oauth/start
-pub async fn openai_codex_oauth_start() -> impl IntoResponse {
-    use openfang_runtime::oauth_providers::openai_codex_start_device_flow;
+#[derive(serde::Deserialize)]
+pub struct CodexOAuthCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
 
-    // Clean up expired flows first
-    CODEX_FLOWS.retain(|_, state| state.expires_at > Instant::now());
+#[derive(Clone)]
+struct CodexLocalCallbackState {
+    app_state: Arc<AppState>,
+    shutdown: Arc<tokio::sync::Notify>,
+}
 
-    match openai_codex_start_device_flow().await {
-        Ok(resp) => {
-            let poll_id = uuid::Uuid::new_v4().to_string();
-            let interval = resp.interval.unwrap_or(5);
+fn bind_codex_callback_listener() -> Result<tokio::net::TcpListener, String> {
+    let listener = StdTcpListener::bind("127.0.0.1:1455").map_err(|e| {
+        format!(
+            "Failed to bind Codex callback listener on 127.0.0.1:1455: {e}. \
+             The official Codex browser flow expects http://localhost:1455/auth/callback."
+        )
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("Failed to configure local callback listener: {e}"))?;
+    tokio::net::TcpListener::from_std(listener)
+        .map_err(|e| format!("Failed to create local callback listener: {e}"))
+}
 
-            CODEX_FLOWS.insert(
-                poll_id.clone(),
-                CodexFlowState {
-                    device_code: resp.device_code,
-                    interval,
-                    expires_at: Instant::now() + std::time::Duration::from_secs(resp.expires_in),
-                },
-            );
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "user_code": resp.user_code,
-                    "verification_uri": resp.verification_uri,
-                    "poll_id": poll_id,
-                    "expires_in": resp.expires_in,
-                    "interval": interval,
-                })),
-            )
+async fn bind_codex_callback_listener_with_retry() -> Result<tokio::net::TcpListener, String> {
+    let mut last_error = None;
+    for _ in 0..8 {
+        match bind_codex_callback_listener() {
+            Ok(listener) => return Ok(listener),
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e })),
-        ),
     }
+
+    Err(last_error.unwrap_or_else(|| {
+        "Failed to bind Codex callback listener on 127.0.0.1:1455".to_string()
+    }))
 }
 
-/// GET /api/providers/openai-codex/oauth/poll/{poll_id}
-pub async fn openai_codex_oauth_poll(Path(poll_id): Path<String>) -> impl IntoResponse {
-    use openfang_runtime::oauth_providers::{openai_codex_poll_device_flow, DeviceFlowStatus};
+fn codex_flow_cleanup() {
+    let now = Instant::now();
+    CODEX_FLOWS.retain(|_, state| state.expires_at > now);
+    CODEX_FLOW_STATES.retain(|_, poll_id| CODEX_FLOWS.contains_key(poll_id));
+}
+
+fn codex_oauth_html(title: &str, body: &str) -> Html<String> {
+    Html(format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title>\
+         <style>body{{font-family:system-ui,sans-serif;max-width:680px;margin:48px auto;padding:0 20px;line-height:1.5;color:#111}}\
+         code{{background:#f3f4f6;padding:2px 6px;border-radius:4px}}\
+         .ok{{color:#166534}} .err{{color:#991b1b}}</style></head>\
+         <body><h1>{title}</h1><p>{body}</p><p>You can return to OpenFang and close this tab.</p>\
+         <script>setTimeout(function(){{window.close();}},1200);</script></body></html>"
+    ))
+}
+
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn persist_codex_tokens(
+    state: &Arc<AppState>,
+    tokens: &openfang_runtime::oauth_providers::OAuthTokenSet,
+) -> Result<(), String> {
+    if let Some(api_key) = tokens
+        .api_key
+        .as_deref()
+        .filter(|api_key| !api_key.trim().is_empty())
+    {
+        persist_runtime_secret(state, "CODEX_API_KEY", api_key)?;
+        std::env::set_var("OPENAI_API_KEY", api_key);
+    } else {
+        clear_runtime_secret(state, "CODEX_API_KEY")?;
+    }
+
+    if let Some(id_token) = tokens.id_token.as_deref() {
+        persist_runtime_secret(state, "CODEX_OAUTH_ID_TOKEN", id_token)?;
+    }
+
+    persist_runtime_secret(state, "CODEX_OAUTH_ACCESS_TOKEN", &tokens.access_token)?;
+
+    if let Some(refresh_token) = tokens.refresh_token.as_deref() {
+        persist_runtime_secret(state, "CODEX_OAUTH_REFRESH_TOKEN", refresh_token)?;
+    }
+
+    state
+        .kernel
+        .model_catalog
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .detect_auth();
+
+    Ok(())
+}
+
+/// POST /api/providers/codex/oauth/start
+pub async fn codex_oauth_start(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use openfang_runtime::oauth_providers::{
+        generate_pkce, generate_state, openai_codex_build_authorize_url,
+    };
+
+    codex_flow_cleanup();
+    CODEX_FLOWS.clear();
+    CODEX_FLOW_STATES.clear();
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let previous_shutdown = {
+        let mut current = CODEX_CALLBACK_SHUTDOWN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        current.replace(shutdown.clone())
+    };
+    if let Some(previous_shutdown) = previous_shutdown {
+        previous_shutdown.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let poll_id = uuid::Uuid::new_v4().to_string();
+    let oauth_state = generate_state();
+    let (code_verifier, code_challenge) = generate_pkce();
+    let listener = match bind_codex_callback_listener_with_retry().await {
+        Ok(listener) => listener,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error})),
+            );
+        }
+    };
+    let redirect_uri = "http://localhost:1455/auth/callback".to_string();
+    let authorize_url =
+        openai_codex_build_authorize_url(&oauth_state, &code_challenge, &redirect_uri);
+    let interval = 2;
+    let expires_in = 15 * 60;
+
+    CODEX_FLOWS.insert(
+        poll_id.clone(),
+        CodexFlowState {
+            oauth_state: oauth_state.clone(),
+            code_verifier,
+            redirect_uri,
+            interval,
+            expires_at: Instant::now() + std::time::Duration::from_secs(expires_in),
+            status: CodexFlowStatus::Pending,
+        },
+    );
+    CODEX_FLOW_STATES.insert(oauth_state, poll_id.clone());
+
+    let callback_state = Arc::new(CodexLocalCallbackState {
+        app_state: state.clone(),
+        shutdown: shutdown.clone(),
+    });
+    let callback_app = Router::new()
+        .route("/auth/callback", get(codex_oauth_local_callback))
+        .with_state(callback_state);
+    let server_shutdown = shutdown.clone();
+
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, callback_app)
+            .with_graceful_shutdown(async move {
+                server_shutdown.notified().await;
+            })
+            .await
+        {
+            tracing::warn!("Codex local callback server failed: {error}");
+        }
+    });
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(expires_in)).await;
+        shutdown.notify_waiters();
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "mode": "browser",
+            "authorize_url": authorize_url,
+            "verification_uri": authorize_url,
+            "poll_id": poll_id,
+            "expires_in": expires_in,
+            "interval": interval,
+        })),
+    )
+}
+
+/// GET /api/providers/codex/oauth/poll/{poll_id}
+pub async fn codex_oauth_poll(Path(poll_id): Path<String>) -> impl IntoResponse {
+    codex_flow_cleanup();
 
     let flow = match CODEX_FLOWS.get(&poll_id) {
         Some(f) => f,
@@ -11025,55 +11474,207 @@ pub async fn openai_codex_oauth_poll(Path(poll_id): Path<String>) -> impl IntoRe
     if flow.expires_at <= Instant::now() {
         drop(flow);
         CODEX_FLOWS.remove(&poll_id);
+        CODEX_FLOW_STATES.retain(|_, current_poll_id| current_poll_id != &poll_id);
         return (
             StatusCode::OK,
             Json(serde_json::json!({"status": "expired"})),
         );
     }
 
-    let device_code = flow.device_code.clone();
-    let _interval = flow.interval;
+    let status = flow.status.clone();
+    let interval = flow.interval;
     drop(flow);
 
-    match openai_codex_poll_device_flow(&device_code).await {
-        DeviceFlowStatus::Complete { tokens } => {
+    match status {
+        CodexFlowStatus::Complete => {
             CODEX_FLOWS.remove(&poll_id);
+            CODEX_FLOW_STATES.retain(|_, current_poll_id| current_poll_id != &poll_id);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "complete",
-                    "access_token": tokens.access_token,
-                    "refresh_token": tokens.refresh_token,
+                    "provider": "codex",
                 })),
             )
         }
-        DeviceFlowStatus::Pending => (
+        CodexFlowStatus::Pending => (
             StatusCode::OK,
-            Json(serde_json::json!({"status": "pending"})),
+            Json(serde_json::json!({"status": "pending", "interval": interval})),
         ),
-        DeviceFlowStatus::SlowDown { new_interval } => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "slow_down", "interval": new_interval})),
-        ),
-        DeviceFlowStatus::Expired => {
+        CodexFlowStatus::Error(error) => {
             CODEX_FLOWS.remove(&poll_id);
+            CODEX_FLOW_STATES.retain(|_, current_poll_id| current_poll_id != &poll_id);
             (
                 StatusCode::OK,
-                Json(serde_json::json!({"status": "expired"})),
+                Json(serde_json::json!({"status": "error", "error": error})),
             )
         }
-        DeviceFlowStatus::AccessDenied => {
-            CODEX_FLOWS.remove(&poll_id);
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "denied"})),
-            )
-        }
-        DeviceFlowStatus::Error(e) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "error", "error": e})),
-        ),
     }
+}
+
+async fn codex_oauth_complete_callback(
+    state: Arc<AppState>,
+    Query(query): Query<CodexOAuthCallbackQuery>,
+) -> Html<String> {
+    use openfang_runtime::oauth_providers::{
+        openai_codex_exchange_code_for_redirect, openai_codex_obtain_api_key,
+    };
+
+    codex_flow_cleanup();
+
+    let oauth_state = match query.state.as_deref() {
+        Some(value) if !value.is_empty() => value.to_string(),
+        _ => {
+            return codex_oauth_html(
+                "Codex Login Failed",
+                "<span class=\"err\">Missing OAuth state. Return to OpenFang and try again.</span>",
+            );
+        }
+    };
+
+    let poll_id = match CODEX_FLOW_STATES.get(&oauth_state) {
+        Some(entry) => entry.value().clone(),
+        None => {
+            return codex_oauth_html(
+                "Codex Login Failed",
+                "<span class=\"err\">This OAuth session is no longer active. Start the login again from OpenFang.</span>",
+            );
+        }
+    };
+
+    let (code_verifier, redirect_uri, expires_at, stored_state) = match CODEX_FLOWS.get(&poll_id) {
+        Some(flow) => (
+            flow.code_verifier.clone(),
+            flow.redirect_uri.clone(),
+            flow.expires_at,
+            flow.oauth_state.clone(),
+        ),
+        None => {
+            CODEX_FLOW_STATES.remove(&oauth_state);
+            return codex_oauth_html(
+                "Codex Login Failed",
+                "<span class=\"err\">This OAuth session expired. Start the login again from OpenFang.</span>",
+            );
+        }
+    };
+
+    if stored_state != oauth_state {
+        if let Some(mut flow) = CODEX_FLOWS.get_mut(&poll_id) {
+            flow.status = CodexFlowStatus::Error("OAuth state mismatch".into());
+        }
+        return codex_oauth_html(
+            "Codex Login Failed",
+            "<span class=\"err\">OAuth state mismatch. Return to OpenFang and retry.</span>",
+        );
+    }
+
+    if expires_at <= Instant::now() {
+        if let Some(mut flow) = CODEX_FLOWS.get_mut(&poll_id) {
+            flow.status = CodexFlowStatus::Error("OAuth session expired".into());
+        }
+        return codex_oauth_html(
+            "Codex Login Expired",
+            "<span class=\"err\">This login attempt expired. Return to OpenFang and start a new one.</span>",
+        );
+    }
+
+    if let Some(error) = query.error.as_deref() {
+        let message = query
+            .error_description
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| error.to_string());
+        if let Some(mut flow) = CODEX_FLOWS.get_mut(&poll_id) {
+            flow.status = CodexFlowStatus::Error(message.clone());
+        }
+        return codex_oauth_html(
+            "Codex Login Failed",
+            &format!("<span class=\"err\">{}</span>", html_escape(&message)),
+        );
+    }
+
+    let code = match query.code.as_deref() {
+        Some(code) if !code.is_empty() => code.to_string(),
+        _ => {
+            if let Some(mut flow) = CODEX_FLOWS.get_mut(&poll_id) {
+                flow.status = CodexFlowStatus::Error("Missing authorization code".into());
+            }
+            return codex_oauth_html(
+                "Codex Login Failed",
+                "<span class=\"err\">Missing authorization code. Return to OpenFang and try again.</span>",
+            );
+        }
+    };
+
+    let outcome: Result<(), String> = match openai_codex_exchange_code_for_redirect(
+        &code,
+        &code_verifier,
+        &redirect_uri,
+    )
+    .await
+    {
+        Ok(mut tokens) => {
+            let id_token = match tokens.id_token.clone() {
+                Some(id_token) if !id_token.is_empty() => id_token,
+                _ => {
+                    return codex_oauth_html(
+                        "Codex Login Failed",
+                        "<span class=\"err\">Codex token exchange did not return an id_token.</span>",
+                    );
+                }
+            };
+
+            match openai_codex_obtain_api_key(&id_token).await {
+                Ok(api_key) => {
+                    tokens.api_key = Some(api_key);
+                    persist_codex_tokens(&state, &tokens)
+                }
+                Err(error) => {
+                    tracing::info!("Codex API key exchange skipped: {error}");
+                    persist_codex_tokens(&state, &tokens)
+                }
+            }
+        }
+        Err(e) => Err(e),
+    };
+
+    match outcome {
+        Ok(()) => {
+            if let Some(mut flow) = CODEX_FLOWS.get_mut(&poll_id) {
+                flow.status = CodexFlowStatus::Complete;
+            }
+            codex_oauth_html(
+                "Codex Login Complete",
+                "<span class=\"ok\">OpenAI Codex is now authenticated in OpenFang.</span>",
+            )
+        }
+        Err(error) => {
+            if let Some(mut flow) = CODEX_FLOWS.get_mut(&poll_id) {
+                flow.status = CodexFlowStatus::Error(error.clone());
+            }
+            codex_oauth_html(
+                "Codex Login Failed",
+                &format!("<span class=\"err\">{}</span>", html_escape(&error)),
+            )
+        }
+    }
+}
+
+async fn codex_oauth_local_callback(
+    State(local_state): State<Arc<CodexLocalCallbackState>>,
+    query: Query<CodexOAuthCallbackQuery>,
+) -> Html<String> {
+    let response = codex_oauth_complete_callback(local_state.app_state.clone(), query).await;
+    local_state.shutdown.notify_waiters();
+    response
+}
+
+/// GET /api/providers/codex/oauth/callback
+pub async fn codex_oauth_callback(
+    State(state): State<Arc<AppState>>,
+    query: Query<CodexOAuthCallbackQuery>,
+) -> impl IntoResponse {
+    codex_oauth_complete_callback(state, query).await
 }
 
 // ---------------------------------------------------------------------------

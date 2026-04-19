@@ -125,6 +125,8 @@ pub async fn auth(
         || path == "/api/logs/stream"  // SSE stream, read-only
         || (path.starts_with("/api/cron/") && is_get)
         || path.starts_with("/api/providers/github-copilot/oauth/")
+        || path.starts_with("/api/providers/codex/oauth/")
+        || path.starts_with("/api/providers/openai-codex/oauth/")
         || path == "/api/auth/login"
         || path == "/api/auth/logout"
         || (path == "/api/auth/check" && is_get);

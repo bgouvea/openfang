@@ -386,6 +386,8 @@ pub struct ModelConfig {
     pub api_key_env: Option<String>,
     /// Optional base URL override for the provider.
     pub base_url: Option<String>,
+    /// Optional reasoning effort preset for providers that support it.
+    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
 }
 
 impl Default for ModelConfig {
@@ -398,6 +400,7 @@ impl Default for ModelConfig {
             system_prompt: "You are a helpful AI agent.".to_string(),
             api_key_env: None,
             base_url: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -1175,6 +1178,20 @@ provider = "openai"
         let cfg: ModelConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.model, "gpt-4o");
         assert_eq!(cfg.provider, "openai");
+    }
+
+    #[test]
+    fn test_model_config_reasoning_effort_parses() {
+        let toml_str = r#"
+model = "gpt-5.4"
+provider = "codex"
+reasoning_effort = "high"
+"#;
+        let cfg: ModelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.reasoning_effort,
+            Some(crate::config::ReasoningEffort::High)
+        );
     }
 
     // ----- Multi-line system_prompt TOML tests (wizard generateToml output) -----

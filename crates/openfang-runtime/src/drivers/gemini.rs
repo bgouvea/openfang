@@ -599,6 +599,7 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
         .usage_metadata
         .map(|u| TokenUsage {
             input_tokens: u.prompt_token_count,
+            cached_input_tokens: 0,
             output_tokens: u.candidates_token_count,
         })
         .unwrap_or_default();
@@ -608,6 +609,7 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
         stop_reason,
         tool_calls,
         usage,
+        response_id: None,
     })
 }
 
@@ -1083,6 +1085,7 @@ impl LlmDriver for GeminiDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                response_id: None,
             });
         }
 
@@ -1249,6 +1252,8 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            continuity_key: None,
+            previous_response_id: None,
         };
 
         let tools = convert_tools(&request);
@@ -1267,6 +1272,8 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            continuity_key: None,
+            previous_response_id: None,
         };
 
         let tools = convert_tools(&request);

@@ -653,8 +653,10 @@ fn convert_response(resp: ConverseResponse) -> Result<CompletionResponse, LlmErr
         tool_calls,
         usage: TokenUsage {
             input_tokens: resp.usage.input_tokens,
+            cached_input_tokens: 0,
             output_tokens: resp.usage.output_tokens,
         },
+        response_id: None,
     })
 }
 

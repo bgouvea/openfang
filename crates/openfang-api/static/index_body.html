@@ -977,13 +977,26 @@
                       </template>
                       <template x-if="editingModel">
                         <span class="flex gap-1" style="align-items:center">
-                          <input class="form-input" style="width:240px;font-size:12px" x-model="newModelValue" placeholder="provider/model" @keydown.enter="changeModel()" @keydown.escape="editingModel = false">
+                          <template x-if="detailProviderModels.length">
+                            <select class="form-select" style="width:240px;font-size:12px" x-model="newModelValue">
+                              <template x-for="m in detailProviderModels" :key="m.id">
+                                <option :value="m.id" x-text="m.display_name || m.id"></option>
+                              </template>
+                            </select>
+                          </template>
+                          <template x-if="!detailProviderModels.length">
+                            <input class="form-input" style="width:240px;font-size:12px" x-model="newModelValue" placeholder="provider/model" @keydown.enter="changeModel()" @keydown.escape="editingModel = false">
+                          </template>
                           <button class="btn btn-primary btn-sm" @click="changeModel()" :disabled="modelSaving" style="padding:2px 10px">
                             <span x-show="!modelSaving">Save</span><span x-show="modelSaving">...</span>
                           </button>
                           <button class="btn btn-ghost btn-sm" @click="editingModel = false" style="padding:2px 8px">Cancel</button>
                         </span>
                       </template>
+                    </div>
+                    <div class="detail-row" x-show="providerSupportsReasoningEffort(detailAgent.model_provider) || detailAgent.reasoning_effort">
+                      <span class="detail-label">Thinking</span>
+                      <span class="detail-value" x-text="formatReasoningEffort(detailAgent.reasoning_effort)"></span>
                     </div>
                     <div class="detail-row"><span class="detail-label">Created</span><span class="detail-value" x-text="detailAgent.created_at ? new Date(detailAgent.created_at).toLocaleString() : '-'"></span></div>
 
@@ -1056,6 +1069,15 @@
                 <div x-show="detailTab === 'config'">
                   <div class="form-group"><label>Name</label><input class="form-input" x-model="configForm.name"></div>
                   <div class="form-group"><label>System Prompt</label><textarea class="form-textarea" x-model="configForm.system_prompt" style="height:80px"></textarea></div>
+                  <div class="form-group" x-show="providerSupportsReasoningEffort(detailAgent.model_provider)">
+                    <label>Thinking / Reasoning</label>
+                    <select class="form-select" x-model="configForm.reasoning_effort">
+                      <template x-for="opt in reasoningEffortOptions()" :key="opt.value || 'default'">
+                        <option :value="opt.value" x-text="opt.label"></option>
+                      </template>
+                    </select>
+                    <div class="text-xs text-dim mt-1">Controls Codex reasoning effort for this agent.</div>
+                  </div>
                   <div class="form-group"><label>Emoji</label>
                     <div class="emoji-grid">
                       <template x-for="em in emojiOptions" :key="em">
@@ -1184,7 +1206,7 @@
                   <div x-show="spawnStep === 2">
                     <div class="form-group">
                       <label>Provider</label>
-                      <select class="form-select" x-model="spawnForm.provider">
+                      <select class="form-select" x-model="spawnForm.provider" @change="syncSpawnModelSelection()">
                         <template x-if="spawnProvidersLoading">
                           <option disabled>Loading providers…</option>
                         </template>
@@ -1209,7 +1231,24 @@
                     </div>
                     <div class="form-group">
                       <label>Model</label>
-                      <input class="form-input" x-model="spawnForm.model" placeholder="e.g. llama-3.3-70b-versatile">
+                      <template x-if="spawnProviderModels.length">
+                        <select class="form-select" x-model="spawnForm.model">
+                          <template x-for="m in spawnProviderModels" :key="m.id">
+                            <option :value="m.id" x-text="m.display_name || m.id"></option>
+                          </template>
+                        </select>
+                      </template>
+                      <template x-if="!spawnProviderModels.length">
+                        <input class="form-input" x-model="spawnForm.model" placeholder="e.g. llama-3.3-70b-versatile">
+                      </template>
+                    </div>
+                    <div class="form-group" x-show="providerSupportsReasoningEffort(spawnForm.provider)">
+                      <label>Thinking / Reasoning</label>
+                      <select class="form-select" x-model="spawnForm.reasoningEffort">
+                        <template x-for="opt in reasoningEffortOptions()" :key="opt.value || 'default'">
+                          <option :value="opt.value" x-text="opt.label"></option>
+                        </template>
+                      </select>
                     </div>
                     <div class="form-group">
                       <label>System Prompt</label>
@@ -1279,6 +1318,7 @@
                       <div class="detail-grid" style="gap:6px">
                         <div class="detail-row"><span class="detail-label">Provider</span><span class="detail-value" x-text="spawnForm.provider"></span></div>
                         <div class="detail-row"><span class="detail-label">Model</span><span class="detail-value" x-text="spawnForm.model"></span></div>
+                        <div class="detail-row" x-show="providerSupportsReasoningEffort(spawnForm.provider) || spawnForm.reasoningEffort"><span class="detail-label">Thinking</span><span class="detail-value" x-text="formatReasoningEffort(spawnForm.reasoningEffort)"></span></div>
                         <div class="detail-row"><span class="detail-label">Profile</span><span class="detail-value" x-text="spawnForm.profile"></span></div>
                         <div class="detail-row" x-show="selectedPreset"><span class="detail-label">Personality</span><span class="detail-value" style="text-transform:capitalize" x-text="selectedPreset"></span></div>
                       </div>
@@ -3316,12 +3356,16 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                     </div>
                   </template>
                   <!-- OpenAI Codex OAuth button -->
-                  <template x-if="p.id === 'openai-codex' && p.auth_status !== 'configured'">
+                  <template x-if="p.id === 'codex' && p.auth_status !== 'configured'">
                     <div class="mt-2">
-                      <button class="btn btn-primary btn-sm" @click="startCodexOAuth()" :disabled="codexOAuth.polling" x-show="!codexOAuth.userCode">Login with OpenAI</button>
-                      <div x-show="codexOAuth.userCode" class="mt-2">
-                        <div class="text-sm">Visit <a :href="codexOAuth.verificationUri" target="_blank" x-text="codexOAuth.verificationUri" style="color:var(--accent-light)"></a> and enter:</div>
-                        <div style="font-size:24px;font-weight:bold;letter-spacing:4px;margin:8px 0;color:var(--accent-light)" x-text="codexOAuth.userCode"></div>
+                      <button class="btn btn-primary btn-sm" @click="startCodexOAuth()" :disabled="codexOAuth.polling" x-show="!codexOAuth.polling">Login with OpenAI</button>
+                      <div x-show="codexOAuth.polling" class="mt-2">
+                        <div class="text-sm">Complete the login in the browser window opened by OpenFang.</div>
+                        <div class="text-xs text-dim mt-1" x-show="codexOAuth.verificationUri">If it did not open, continue here: <a :href="codexOAuth.verificationUri" target="_blank" x-text="codexOAuth.verificationUri" style="color:var(--accent-light)"></a></div>
+                        <div x-show="codexOAuth.userCode">
+                          <div class="text-sm mt-2">Enter this code if requested:</div>
+                          <div style="font-size:24px;font-weight:bold;letter-spacing:4px;margin:8px 0;color:var(--accent-light)" x-text="codexOAuth.userCode"></div>
+                        </div>
                         <div class="text-xs text-dim"><span class="spinner" style="width:10px;height:10px;border-width:2px;display:inline-block;vertical-align:middle"></span> Waiting for authorization...</div>
                       </div>
                     </div>
@@ -4067,6 +4111,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
           <div x-show="!loading && !loadError">
           <div class="stats-row">
             <div class="stat-card"><div class="stat-value" x-text="formatTokens((summary.total_input_tokens || 0) + (summary.total_output_tokens || 0))"></div><div class="stat-label">Total Tokens</div></div>
+            <div class="stat-card"><div class="stat-value" x-text="formatTokens(summary.total_cached_input_tokens || 0)"></div><div class="stat-label">Cached Input</div></div>
             <div class="stat-card"><div class="stat-value" x-text="formatCost(summary.total_cost_usd)"></div><div class="stat-label">Estimated Cost</div></div>
             <div class="stat-card"><div class="stat-value" x-text="summary.call_count || 0"></div><div class="stat-label">API Calls</div></div>
             <div class="stat-card"><div class="stat-value" x-text="summary.total_tool_calls || 0"></div><div class="stat-label">Tool Calls</div></div>
@@ -4082,6 +4127,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <div class="card-header">Token Breakdown</div>
               <div class="detail-grid" style="margin-top:8px">
                 <div class="detail-row"><span class="detail-label">Input Tokens</span><span class="detail-value" x-text="formatTokens(summary.total_input_tokens)"></span></div>
+                <div class="detail-row"><span class="detail-label">Cached Input Tokens</span><span class="detail-value" x-text="formatTokens(summary.total_cached_input_tokens)"></span></div>
                 <div class="detail-row"><span class="detail-label">Output Tokens</span><span class="detail-value" x-text="formatTokens(summary.total_output_tokens)"></span></div>
                 <div class="detail-row"><span class="detail-label">Total Cost</span><span class="detail-value" x-text="formatCost(summary.total_cost_usd)"></span></div>
                 <div class="detail-row"><span class="detail-label">API Calls</span><span class="detail-value" x-text="summary.call_count || 0"></span></div>
@@ -4092,13 +4138,14 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
           <div x-show="tab === 'by-model'">
             <div class="table-wrap mt-4" x-show="byModel.length">
               <table>
-                <thead><tr><th>Model</th><th>Calls</th><th>Input Tokens</th><th>Output Tokens</th><th>Cost</th><th style="width:30%">Usage</th></tr></thead>
+                <thead><tr><th>Model</th><th>Calls</th><th>Input Tokens</th><th>Cached Input</th><th>Output Tokens</th><th>Cost</th><th style="width:30%">Usage</th></tr></thead>
                 <tbody>
                   <template x-for="m in byModel" :key="m.model">
                     <tr>
                       <td class="font-bold" style="font-size:11px" x-text="m.model"></td>
                       <td x-text="m.call_count"></td>
                       <td x-text="formatTokens(m.total_input_tokens)"></td>
+                      <td x-text="formatTokens(m.total_cached_input_tokens)"></td>
                       <td x-text="formatTokens(m.total_output_tokens)"></td>
                       <td x-text="formatCost(m.total_cost_usd)"></td>
                       <td><div style="background:var(--surface2);border-radius:4px;height:16px;overflow:hidden"><div style="height:100%;border-radius:4px;background:var(--accent);transition:width 0.3s" :style="{ width: barWidth(m) }"></div></div></td>
@@ -4112,12 +4159,13 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
           <div x-show="tab === 'by-agent'">
             <div class="table-wrap mt-4" x-show="byAgent.length">
               <table>
-                <thead><tr><th>Agent</th><th>Total Tokens</th><th>Tool Calls</th></tr></thead>
+                <thead><tr><th>Agent</th><th>Total Tokens</th><th>Cached Input</th><th>Tool Calls</th></tr></thead>
                 <tbody>
                   <template x-for="a in byAgent" :key="a.agent_id">
                     <tr>
                       <td class="font-bold" x-text="a.name"></td>
                       <td x-text="a.total_tokens ? a.total_tokens.toLocaleString() : '0'"></td>
+                      <td x-text="a.cached_input_tokens ? a.cached_input_tokens.toLocaleString() : '0'"></td>
                       <td x-text="a.tool_calls || 0"></td>
                     </tr>
                   </template>

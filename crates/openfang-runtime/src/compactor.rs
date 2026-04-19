@@ -467,6 +467,8 @@ async fn summarize_messages(
                 .to_string(),
         ),
         thinking: None,
+        continuity_key: None,
+        previous_response_id: None,
     };
 
     // Retry logic for transient failures
@@ -585,6 +587,8 @@ async fn summarize_in_chunks(
                 .to_string(),
         ),
         thinking: None,
+        continuity_key: None,
+        previous_response_id: None,
     };
 
     match driver.complete(merge_request).await {
@@ -830,8 +834,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 100,
+                        cached_input_tokens: 0,
                         output_tokens: 50,
                     },
+                    response_id: None,
                 })
             }
         }
@@ -892,8 +898,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 100,
+                        cached_input_tokens: 0,
                         output_tokens: 50,
                     },
+                    response_id: None,
                 })
             }
         }
@@ -985,8 +993,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 500,
+                        cached_input_tokens: 0,
                         output_tokens: 100,
                     },
+                    response_id: None,
                 })
             }
         }
@@ -1181,8 +1191,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 50,
+                        cached_input_tokens: 0,
                         output_tokens: 20,
                     },
+                    response_id: None,
                 })
             }
         }

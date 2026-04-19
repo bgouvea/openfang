@@ -55,6 +55,7 @@ pub struct MessageRequest {
 pub struct MessageResponse {
     pub response: String,
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub iterations: u32,
     #[serde(skip_serializing_if = "Option::is_none")]

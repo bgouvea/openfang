@@ -7,6 +7,8 @@
 pub mod anthropic;
 pub mod bedrock;
 pub mod claude_code;
+pub mod codex_chatgpt;
+pub mod codex_chatgpt_ws;
 pub mod copilot;
 pub mod fallback;
 pub mod gemini;
@@ -151,9 +153,9 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             "GITHUB_TOKEN",
             true,
         )),
-        "codex" | "openai-codex" => Some(ProviderDefaults::simple(
-            OPENAI_BASE_URL,
-            "OPENAI_API_KEY",
+        "codex" | "openai-codex" | "codex-http" => Some(ProviderDefaults::simple(
+            "https://chatgpt.com/backend-api/codex",
+            "CODEX_API_KEY",
             true,
         )),
         "claude-code" => Some(ProviderDefaults::simple("", "", false)),
@@ -233,7 +235,7 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             base_url: "https://chatgpt.com/backend-api/codex/responses",
             api_key_env: "",
             key_required: false,
-            oauth_provider: Some("openai-codex"),
+            oauth_provider: Some("codex"),
         }),
         "gemini-oauth" => Some(ProviderDefaults {
             base_url: "https://generativelanguage.googleapis.com/v1beta/models",
@@ -326,20 +328,55 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     }
 
     // Codex — reuses OpenAI driver with credential sync from Codex CLI
-    if provider == "codex" || provider == "openai-codex" {
+    if provider == "codex" || provider == "openai-codex" || provider == "codex-http" {
         let api_key = config
             .api_key
             .clone()
+            .or_else(|| std::env::var("CODEX_API_KEY").ok())
+            .or_else(|| std::env::var("CODEX_OAUTH_ACCESS_TOKEN").ok())
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             .or_else(crate::model_catalog::read_codex_credential)
             .ok_or_else(|| {
-                LlmError::MissingApiKey("Set OPENAI_API_KEY or install Codex CLI".to_string())
+                LlmError::MissingApiKey(
+                    "Set CODEX_API_KEY, CODEX_OAUTH_ACCESS_TOKEN, OPENAI_API_KEY, or authenticate Codex locally".to_string(),
+                )
             })?;
         let base_url = config
             .base_url
             .clone()
-            .unwrap_or_else(|| OPENAI_BASE_URL.to_string());
-        return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
+            .unwrap_or_else(|| "https://chatgpt.com/backend-api/codex".to_string());
+
+        let oauth_access_token = config
+            .api_key
+            .clone()
+            .filter(|value| looks_like_jwt(value))
+            .or_else(|| {
+                std::env::var("CODEX_OAUTH_ACCESS_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| {
+                crate::model_catalog::read_codex_credential().filter(|value| looks_like_jwt(value))
+            });
+
+        if let Some(access_token) = oauth_access_token {
+            if provider == "codex-http" {
+                return Ok(Arc::new(codex_chatgpt::CodexChatGPTDriver::new(
+                    access_token,
+                    base_url,
+                )));
+            }
+
+            return Ok(Arc::new(codex_chatgpt_ws::CodexChatGPTWsDriver::new(
+                access_token,
+                base_url,
+            )));
+        }
+
+        return Ok(Arc::new(openai::OpenAIDriver::new(
+            api_key,
+            OPENAI_BASE_URL.to_string(),
+        )));
     }
 
     // Claude Code CLI — subprocess-based, no API key needed
@@ -641,6 +678,14 @@ pub fn known_providers() -> &'static [&'static str] {
         "qwen-code",
         "azure",
     ]
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    let mut parts = value.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), None) if !a.is_empty() && !b.is_empty() && !c.is_empty()
+    )
 }
 
 #[cfg(test)]

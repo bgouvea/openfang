@@ -102,7 +102,10 @@ impl ModelCatalog {
             let has_fallback = match provider.id.as_str() {
                 "gemini" => std::env::var("GOOGLE_API_KEY").is_ok(),
                 "codex" => {
-                    std::env::var("OPENAI_API_KEY").is_ok() || read_codex_credential().is_some()
+                    std::env::var("CODEX_API_KEY").is_ok()
+                        || std::env::var("CODEX_OAUTH_ACCESS_TOKEN").is_ok()
+                        || std::env::var("OPENAI_API_KEY").is_ok()
+                        || read_codex_credential().is_some()
                 }
                 // claude-code is handled above (before key_required check)
                 _ => false,
@@ -496,11 +499,12 @@ impl Default for ModelCatalog {
     }
 }
 
-/// Read an OpenAI API key from the Codex CLI credential file.
+/// Read a bearer credential from the Codex CLI credential file.
 ///
 /// Checks `$CODEX_HOME/auth.json` or `~/.codex/auth.json`.
-/// Returns `Some(api_key)` if the file exists and contains a valid, non-expired token.
-/// Only checks presence — the actual key value is used transiently, never stored.
+/// Returns the best available runtime credential:
+/// - `OPENAI_API_KEY` when present
+/// - otherwise the stored OAuth `access_token`
 pub fn read_codex_credential() -> Option<String> {
     let codex_home = std::env::var("CODEX_HOME")
         .map(std::path::PathBuf::from)
@@ -536,9 +540,11 @@ pub fn read_codex_credential() -> Option<String> {
     }
 
     parsed
-        .get("api_key")
+        .get("OPENAI_API_KEY")
+        .or_else(|| parsed.get("openai_api_key"))
+        .or_else(|| parsed.get("api_key"))
         .or_else(|| parsed.get("token"))
-        .or_else(|| parsed.get("tokens").and_then(|t| t.get("id_token")))
+        .or_else(|| parsed.get("tokens").and_then(|t| t.get("access_token")))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
@@ -905,8 +911,8 @@ fn builtin_providers() -> Vec<ProviderInfo> {
         ProviderInfo {
             id: "codex".into(),
             display_name: "OpenAI Codex".into(),
-            api_key_env: "OPENAI_API_KEY".into(),
-            base_url: OPENAI_BASE_URL.into(),
+            api_key_env: "CODEX_API_KEY".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
             key_required: true,
             auth_status: AuthStatus::Missing,
             model_count: 0,
@@ -996,8 +1002,9 @@ fn builtin_aliases() -> HashMap<String, String> {
         // Codex aliases
         ("codex", "codex/gpt-5.4"),
         ("codex-5.4", "codex/gpt-5.4"),
-        ("codex-4.1", "codex/gpt-4.1"),
-        ("codex-o4", "codex/o4-mini"),
+        ("codex-5.4-mini", "codex/gpt-5.4-mini"),
+        ("codex-5.3", "codex/gpt-5.3-codex"),
+        ("codex-5.2", "codex/gpt-5.2"),
         // NVIDIA NIM aliases
         ("nemotron", "nvidia/llama-3.1-nemotron-70b-instruct"),
         // Venice aliases
@@ -3624,7 +3631,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // OpenAI Codex (2) — reuses OpenAI driver
+        // OpenAI Codex (4) — ChatGPT-backed Codex Responses API
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
             id: "codex/gpt-5.4".into(),
@@ -3641,8 +3648,22 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec!["codex".into(), "codex-5.4".into()],
         },
         ModelCatalogEntry {
-            id: "codex/gpt-4.1".into(),
-            display_name: "GPT-4.1 (Codex)".into(),
+            id: "codex/gpt-5.4-mini".into(),
+            display_name: "GPT-5.4 Mini (Codex)".into(),
+            provider: "codex".into(),
+            tier: ModelTier::Smart,
+            context_window: 400_000,
+            max_output_tokens: 128_000,
+            input_cost_per_m: 0.75,
+            output_cost_per_m: 4.50,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["codex-5.4-mini".into()],
+        },
+        ModelCatalogEntry {
+            id: "codex/gpt-5.3-codex".into(),
+            display_name: "GPT-5.3 Codex".into(),
             provider: "codex".into(),
             tier: ModelTier::Frontier,
             context_window: 1_047_576,
@@ -3652,21 +3673,21 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["codex-4.1".into()],
+            aliases: vec!["codex-5.3".into()],
         },
         ModelCatalogEntry {
-            id: "codex/o4-mini".into(),
-            display_name: "o4-mini (Codex)".into(),
+            id: "codex/gpt-5.2".into(),
+            display_name: "GPT-5.2 (Codex)".into(),
             provider: "codex".into(),
             tier: ModelTier::Smart,
-            context_window: 200_000,
-            max_output_tokens: 100_000,
-            input_cost_per_m: 1.10,
-            output_cost_per_m: 4.40,
+            context_window: 272_000,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 2.00,
+            output_cost_per_m: 8.00,
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["codex-o4".into()],
+            aliases: vec!["codex-5.2".into()],
         },
         // ══════════════════════════════════════════════════════════════
         // Claude Code CLI (3) — subprocess-based
@@ -4228,7 +4249,7 @@ mod tests {
         let catalog = ModelCatalog::new();
         let codex = catalog.get_provider("codex").unwrap();
         assert_eq!(codex.display_name, "OpenAI Codex");
-        assert_eq!(codex.api_key_env, "OPENAI_API_KEY");
+        assert_eq!(codex.api_key_env, "CODEX_API_KEY");
         assert!(codex.key_required);
     }
 
@@ -4236,10 +4257,11 @@ mod tests {
     fn test_codex_models() {
         let catalog = ModelCatalog::new();
         let models = catalog.models_by_provider("codex");
-        assert_eq!(models.len(), 3);
+        assert_eq!(models.len(), 4);
         assert!(models.iter().any(|m| m.id == "codex/gpt-5.4"));
-        assert!(models.iter().any(|m| m.id == "codex/gpt-4.1"));
-        assert!(models.iter().any(|m| m.id == "codex/o4-mini"));
+        assert!(models.iter().any(|m| m.id == "codex/gpt-5.4-mini"));
+        assert!(models.iter().any(|m| m.id == "codex/gpt-5.3-codex"));
+        assert!(models.iter().any(|m| m.id == "codex/gpt-5.2"));
     }
 
     #[test]

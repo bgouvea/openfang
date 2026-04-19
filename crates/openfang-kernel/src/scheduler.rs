@@ -163,6 +163,7 @@ mod tests {
             id,
             &TokenUsage {
                 input_tokens: 100,
+                cached_input_tokens: 0,
                 output_tokens: 50,
             },
         );
@@ -183,6 +184,7 @@ mod tests {
             id,
             &TokenUsage {
                 input_tokens: 60,
+                cached_input_tokens: 0,
                 output_tokens: 50,
             },
         );

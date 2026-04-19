@@ -711,11 +711,12 @@ async fn handle_text_message(
                             if is_silent {
                                 let _ = send_json(
                                     sender,
-                                    &serde_json::json!({
-                                        "type": "silent_complete",
-                                        "input_tokens": usage.input_tokens,
-                                        "output_tokens": usage.output_tokens,
-                                    }),
+                                &serde_json::json!({
+                                    "type": "silent_complete",
+                                    "input_tokens": usage.input_tokens,
+                                    "cached_input_tokens": usage.cached_input_tokens,
+                                    "output_tokens": usage.output_tokens,
+                                }),
                                 )
                                 .await;
                                 return;
@@ -752,6 +753,7 @@ async fn handle_text_message(
                                     "type": "response",
                                     "content": content,
                                     "input_tokens": usage.input_tokens,
+                                    "cached_input_tokens": usage.cached_input_tokens,
                                     "output_tokens": usage.output_tokens,
                                     "iterations": 0, // Not available from stream; handle updates later if needed
                                     "cost_usd": null,

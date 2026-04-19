@@ -389,11 +389,11 @@ fn build_user_section(user_name: Option<&str>) -> String {
             )
         }
         None => "## User Profile\n\
-             You don't know the user's name yet. On your FIRST reply in this conversation, \
-             warmly introduce yourself by your agent name and ask what they'd like to be called. \
-             Once they tell you, immediately use the `memory_store` tool with \
-             key \"user_name\" and their name as the value so you remember it for future sessions. \
-             Keep the introduction brief — don't let it overshadow their actual request."
+             You don't know the user's name yet. Do not ask for it by default. \
+             Stay focused on solving the request. Only ask their name if it is genuinely necessary \
+             for the task or relationship context. Do not introduce yourself unless the user asks who you are. \
+             If the user voluntarily tells you their name and you have access to `memory_store`, \
+             store it with key \"user_name\" for future sessions."
             .to_string(),
     }
 }

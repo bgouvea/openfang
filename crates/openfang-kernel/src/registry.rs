@@ -198,6 +198,21 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Update an agent's reasoning effort preset.
+    pub fn update_reasoning_effort(
+        &self,
+        id: AgentId,
+        reasoning_effort: Option<openfang_types::config::ReasoningEffort>,
+    ) -> OpenFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.model.reasoning_effort = reasoning_effort;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Update an agent's fallback model chain.
     pub fn update_fallback_models(
         &self,

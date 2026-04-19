@@ -18,6 +18,7 @@ use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::agent::{AgentManifest, FallbackModel};
+use openfang_types::config::ThinkingConfig;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
 use openfang_types::message::{
@@ -64,6 +65,69 @@ const MAX_CONTINUATIONS: u32 = 5;
 
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
+const CODEX_RESPONSE_ID_KEY_PREFIX: &str = "codex.previous_response_id.";
+
+fn resolve_request_thinking(manifest: &AgentManifest) -> Option<ThinkingConfig> {
+    manifest
+        .model
+        .reasoning_effort
+        .map(|reasoning_effort| ThinkingConfig {
+            reasoning_effort: Some(reasoning_effort),
+            ..ThinkingConfig::default()
+        })
+}
+
+fn codex_response_continuity_key(session: &Session) -> String {
+    format!("{}{}", CODEX_RESPONSE_ID_KEY_PREFIX, session.id)
+}
+
+fn response_continuity_enabled(provider: &str) -> bool {
+    provider.eq_ignore_ascii_case("codex")
+}
+
+fn load_previous_response_id(
+    memory: &MemorySubstrate,
+    provider: &str,
+    session: &Session,
+) -> Option<String> {
+    if !response_continuity_enabled(provider) {
+        return None;
+    }
+
+    memory
+        .structured_get(session.agent_id, &codex_response_continuity_key(session))
+        .ok()
+        .and_then(|value| value)
+        .and_then(|value| value.as_str().map(str::to_string))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn store_previous_response_id(
+    memory: &MemorySubstrate,
+    provider: &str,
+    session: &Session,
+    response_id: Option<&str>,
+) {
+    if !response_continuity_enabled(provider) {
+        return;
+    }
+
+    let Some(response_id) = response_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+
+    if let Err(error) = memory.structured_set(
+        session.agent_id,
+        &codex_response_continuity_key(session),
+        serde_json::json!(response_id),
+    ) {
+        warn!(
+            session_id = %session.id,
+            agent_id = %session.agent_id,
+            "Failed to persist Codex previous_response_id: {error}"
+        );
+    }
+}
 
 /// Detect when the LLM claims to have performed an action (sent, posted, emailed)
 /// without actually calling any tools. Prevents hallucinated completions.
@@ -381,6 +445,8 @@ pub async fn run_agent_loop(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let provider_name = manifest.model.provider.as_str();
+    let mut previous_response_id = load_previous_response_id(memory, provider_name, session);
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
@@ -413,7 +479,9 @@ pub async fn run_agent_loop(
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
-            thinking: None,
+            thinking: resolve_request_thinking(manifest),
+            continuity_key: Some(codex_response_continuity_key(session)),
+            previous_response_id: previous_response_id.clone(),
         };
 
         // Notify phase: Thinking
@@ -428,7 +496,6 @@ pub async fn run_agent_loop(
         }
 
         // Call LLM with retry, error classification, and circuit breaker
-        let provider_name = manifest.model.provider.as_str();
         let mut response = call_with_retry(
             &*driver,
             request,
@@ -438,12 +505,19 @@ pub async fn run_agent_loop(
         )
         .await?;
 
+        if let Some(response_id) = response.response_id.clone() {
+            previous_response_id = Some(response_id.clone());
+            store_previous_response_id(memory, provider_name, session, Some(&response_id));
+        }
+
         total_usage.input_tokens += response.usage.input_tokens;
+        total_usage.cached_input_tokens += response.usage.cached_input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
 
         // Recover tool calls output as text by models that don't use the tool_calls API field
         // (e.g. Groq/Llama, DeepSeek emit `<function=name>{json}</function>` in text)
-        if matches!(
+        if !provider_name.eq_ignore_ascii_case("codex")
+            && matches!(
             response.stop_reason,
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
@@ -853,13 +927,18 @@ pub async fn run_agent_loop(
 
                     // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
                     let content = truncate_tool_result_dynamic(&result.content, &context_budget);
+                    let outcome_warn =
+                        loop_guard.record_outcome(&tool_call.name, &tool_call.input, &result.content);
 
-                    // Append warning if verdict was Warn
-                    let final_content = if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
-                        format!("{content}\n\n[LOOP GUARD] {warn_msg}")
-                    } else {
-                        content
-                    };
+                    let mut final_content = content;
+                    if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
+                        final_content.push_str("\n\n[LOOP GUARD] ");
+                        final_content.push_str(warn_msg);
+                    }
+                    if let Some(ref warn_msg) = outcome_warn {
+                        final_content.push_str("\n\n[LOOP GUARD] ");
+                        final_content.push_str(warn_msg);
+                    }
 
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
@@ -1573,6 +1652,8 @@ pub async fn run_agent_loop_streaming(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let provider_name = manifest.model.provider.as_str();
+    let mut previous_response_id = load_previous_response_id(memory, provider_name, session);
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
@@ -1623,7 +1704,9 @@ pub async fn run_agent_loop_streaming(
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
-            thinking: None,
+            thinking: resolve_request_thinking(manifest),
+            continuity_key: Some(codex_response_continuity_key(session)),
+            previous_response_id: previous_response_id.clone(),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
@@ -1638,7 +1721,6 @@ pub async fn run_agent_loop_streaming(
         }
 
         // Stream LLM call with retry, error classification, and circuit breaker
-        let provider_name = manifest.model.provider.as_str();
         let mut response = stream_with_retry(
             &*driver,
             request,
@@ -1649,11 +1731,18 @@ pub async fn run_agent_loop_streaming(
         )
         .await?;
 
+        if let Some(response_id) = response.response_id.clone() {
+            previous_response_id = Some(response_id.clone());
+            store_previous_response_id(memory, provider_name, session, Some(&response_id));
+        }
+
         total_usage.input_tokens += response.usage.input_tokens;
+        total_usage.cached_input_tokens += response.usage.cached_input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
 
         // Recover tool calls output as text (streaming path)
-        if matches!(
+        if !provider_name.eq_ignore_ascii_case("codex")
+            && matches!(
             response.stop_reason,
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
@@ -2032,13 +2121,18 @@ pub async fn run_agent_loop_streaming(
 
                     // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
                     let content = truncate_tool_result_dynamic(&result.content, &context_budget);
+                    let outcome_warn =
+                        loop_guard.record_outcome(&tool_call.name, &tool_call.input, &result.content);
 
-                    // Append warning if verdict was Warn
-                    let final_content = if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
-                        format!("{content}\n\n[LOOP GUARD] {warn_msg}")
-                    } else {
-                        content
-                    };
+                    let mut final_content = content;
+                    if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
+                        final_content.push_str("\n\n[LOOP GUARD] ");
+                        final_content.push_str(warn_msg);
+                    }
+                    if let Some(ref warn_msg) = outcome_warn {
+                        final_content.push_str("\n\n[LOOP GUARD] ");
+                        final_content.push_str(warn_msg);
+                    }
 
                     // Notify client of tool execution result (detect dead consumer)
                     let preview: String = final_content.chars().take(300).collect();
@@ -3040,11 +3134,19 @@ fn try_parse_bare_json_tool_call(
 /// Deduplicate tool calls from the response.
 /// Returns a reference to the deduplicated tool calls.
 pub fn deduplicate_tool_calls(response: &crate::llm_driver::CompletionResponse) -> Vec<&ToolCall> {
-    let mut hash_set = std::collections::HashSet::new();
+    let mut seen_call_ids = std::collections::HashSet::new();
+    let mut seen_fallback_hashes = std::collections::HashSet::new();
     let mut deduplicated = Vec::new();
     for tool_call in &response.tool_calls {
+        if !tool_call.id.trim().is_empty() {
+            if seen_call_ids.insert(tool_call.id.clone()) {
+                deduplicated.push(tool_call);
+            }
+            continue;
+        }
+
         let hash = LoopGuard::compute_hash(&tool_call.name, &tool_call.input);
-        if hash_set.insert(hash) {
+        if seen_fallback_hashes.insert(hash) {
             deduplicated.push(tool_call);
         }
     }
@@ -3086,6 +3188,33 @@ mod tests {
         let result = truncate_tool_result_dynamic(&long, &budget);
         assert!(result.len() <= budget.per_result_cap() + 200);
         assert!(result.contains("[TRUNCATED:"));
+    }
+
+    #[test]
+    fn test_deduplicate_tool_calls_keeps_distinct_call_ids() {
+        let response = CompletionResponse {
+            content: vec![],
+            stop_reason: StopReason::ToolUse,
+            tool_calls: vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "mcp_agilize_crm_context".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "mcp_agilize_crm_context".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            usage: TokenUsage::default(),
+            response_id: None,
+        };
+
+        let deduplicated = deduplicate_tool_calls(&response);
+        assert_eq!(deduplicated.len(), 2);
+        assert_eq!(deduplicated[0].id, "call_1");
+        assert_eq!(deduplicated[1].id, "call_2");
     }
 
     #[test]
@@ -3180,8 +3309,10 @@ mod tests {
                     }],
                     usage: TokenUsage {
                         input_tokens: 10,
+                        cached_input_tokens: 0,
                         output_tokens: 5,
                     },
+                    response_id: None,
                 })
             } else {
                 // Second call: LLM returns EndTurn with EMPTY text (the bug)
@@ -3191,8 +3322,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 10,
+                        cached_input_tokens: 0,
                         output_tokens: 0,
                     },
+                    response_id: None,
                 })
             }
         }
@@ -3214,8 +3347,10 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage {
                     input_tokens: 10,
+                    cached_input_tokens: 0,
                     output_tokens: 0,
                 },
+                response_id: None,
             })
         }
     }
@@ -3238,8 +3373,10 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage {
                     input_tokens: 10,
+                    cached_input_tokens: 0,
                     output_tokens: 8,
                 },
+                response_id: None,
             })
         }
     }
@@ -3532,8 +3669,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 10,
+                        cached_input_tokens: 0,
                         output_tokens: 0,
                     },
+                    response_id: None,
                 })
             } else {
                 // Second call (retry): normal response
@@ -3546,8 +3685,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 15,
+                        cached_input_tokens: 0,
                         output_tokens: 8,
                     },
+                    response_id: None,
                 })
             }
         }
@@ -3569,8 +3710,10 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage {
                     input_tokens: 10,
+                    cached_input_tokens: 0,
                     output_tokens: 0,
                 },
+                response_id: None,
             })
         }
     }
@@ -4579,8 +4722,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 18,
+                        cached_input_tokens: 0,
                         output_tokens: 10,
                     },
+                    response_id: None,
                 })
             } else {
                 Ok(CompletionResponse {
@@ -4592,8 +4737,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 24,
+                        cached_input_tokens: 0,
                         output_tokens: 8,
                     },
+                    response_id: None,
                 })
             }
         }
@@ -4617,8 +4764,10 @@ mod tests {
                     tool_calls: vec![], // BUG: no tool_calls!
                     usage: TokenUsage {
                         input_tokens: 20,
+                        cached_input_tokens: 0,
                         output_tokens: 15,
                     },
+                    response_id: None,
                 })
             } else {
                 // After tool result, return normal response
@@ -4631,8 +4780,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 30,
+                        cached_input_tokens: 0,
                         output_tokens: 12,
                     },
+                    response_id: None,
                 })
             }
         }

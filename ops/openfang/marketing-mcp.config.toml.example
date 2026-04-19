@@ -1,0 +1,64 @@
+# Paid media MCP stack for OpenFang.
+# Copy the blocks you want into your real config.toml and fill the env vars.
+
+[[mcp_servers]]
+name = "google-ads"
+timeout_secs = 60
+env = [
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_PROJECT_ID",
+  "GOOGLE_ADS_DEVELOPER_TOKEN",
+  "GOOGLE_ADS_LOGIN_CUSTOMER_ID",
+]
+
+[mcp_servers.transport]
+type = "stdio"
+command = "pipx"
+args = [
+  "run",
+  "--spec",
+  "git+https://github.com/googleads/google-ads-mcp.git",
+  "google-ads-mcp",
+]
+
+[[mcp_servers]]
+name = "meta-ads"
+timeout_secs = 60
+env = [
+  "META_ACCESS_TOKEN",
+  "META_APP_ID",
+  "META_APP_SECRET",
+  "META_GRAPH_API_VERSION",
+]
+
+[mcp_servers.transport]
+type = "stdio"
+command = "pipx"
+args = [
+  "run",
+  "--spec",
+  "git+https://github.com/EfrainTorres/armavita-meta-ads-mcp.git",
+  "armavita-meta-ads-mcp",
+]
+
+[[mcp_servers]]
+name = "tiktok-ads"
+timeout_secs = 60
+env = [
+  "TIKTOK_APP_ID",
+  "TIKTOK_APP_SECRET",
+  "TIKTOK_ACCESS_TOKEN",
+]
+
+[mcp_servers.transport]
+type = "stdio"
+command = "pipx"
+args = [
+  "run",
+  "--spec",
+  "git+https://github.com/AdsMCP/tiktok-ads-mcp-server.git",
+  "tiktok-ads-mcp",
+]
+
+# LinkedIn is not included by default here because the free MCP options I found
+# are weak or read-only. The pragmatic path is a custom OpenAPI/HTTP wrapper.

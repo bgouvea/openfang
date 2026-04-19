@@ -26,7 +26,7 @@ function settingsPage() {
     providerTesting: {},
     providerTestResults: {},
     copilotOAuth: { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 },
-    codexOAuth: { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 },
+    codexOAuth: { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5, mode: 'browser' },
     geminiOAuth: { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 },
     qwenOAuth: { polling: false, status: '', pollId: '', message: '' },
     minimaxOAuth: { polling: false, status: '', pollId: '', message: '' },
@@ -490,15 +490,15 @@ function settingsPage() {
 
     // OpenAI Codex OAuth
     async startCodexOAuth() {
-      this.codexOAuth.polling = true;
-      this.codexOAuth.userCode = '';
+      this.codexOAuth = { polling: true, userCode: '', verificationUri: '', pollId: '', interval: 5, mode: 'browser' };
       try {
-        var resp = await OpenFangAPI.post('/api/providers/openai-codex/oauth/start', {});
-        this.codexOAuth.userCode = resp.user_code;
-        this.codexOAuth.verificationUri = resp.verification_uri;
+        var resp = await OpenFangAPI.post('/api/providers/codex/oauth/start', {});
+        this.codexOAuth.userCode = resp.user_code || '';
+        this.codexOAuth.verificationUri = resp.authorize_url || resp.verification_uri || '';
         this.codexOAuth.pollId = resp.poll_id;
         this.codexOAuth.interval = resp.interval || 5;
-        window.open(resp.verification_uri, '_blank');
+        this.codexOAuth.mode = resp.mode || 'browser';
+        window.open(this.codexOAuth.verificationUri, '_blank');
         this.pollCodexOAuth();
       } catch(e) {
         OpenFangToast.error('Failed to start Codex login: ' + e.message);
@@ -511,10 +511,10 @@ function settingsPage() {
       setTimeout(async function() {
         if (!self.codexOAuth.pollId) return;
         try {
-          var resp = await OpenFangAPI.get('/api/providers/openai-codex/oauth/poll/' + self.codexOAuth.pollId);
+          var resp = await OpenFangAPI.get('/api/providers/codex/oauth/poll/' + self.codexOAuth.pollId);
           if (resp.status === 'complete') {
             OpenFangToast.success('OpenAI Codex authenticated successfully!');
-            self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+            self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5, mode: 'browser' };
             await self.loadProviders();
             await self.loadModels();
           } else if (resp.status === 'pending') {
@@ -522,17 +522,17 @@ function settingsPage() {
             self.pollCodexOAuth();
           } else if (resp.status === 'expired') {
             OpenFangToast.error('Device code expired. Please try again.');
-            self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+            self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5, mode: 'browser' };
           } else if (resp.status === 'denied') {
             OpenFangToast.error('Access denied by user.');
-            self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+            self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5, mode: 'browser' };
           } else {
             OpenFangToast.error('OAuth error: ' + (resp.error || resp.status));
-            self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+            self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5, mode: 'browser' };
           }
         } catch(e) {
           OpenFangToast.error('Poll error: ' + e.message);
-          self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+          self.codexOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5, mode: 'browser' };
         }
       }, self.codexOAuth.interval * 1000);
     },

@@ -220,6 +220,9 @@ pub enum StopReason {
 pub struct TokenUsage {
     /// Tokens used for the input/prompt.
     pub input_tokens: u64,
+    /// Input tokens served from provider-side cache.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     /// Tokens generated in the output.
     pub output_tokens: u64,
 }
@@ -265,6 +268,7 @@ mod tests {
     fn test_token_usage() {
         let usage = TokenUsage {
             input_tokens: 100,
+            cached_input_tokens: 0,
             output_tokens: 50,
         };
         assert_eq!(usage.total(), 150);

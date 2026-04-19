@@ -65,6 +65,10 @@ pub struct CompletionRequest {
     pub system: Option<String>,
     /// Extended thinking configuration (if supported by the model).
     pub thinking: Option<openfang_types::config::ThinkingConfig>,
+    /// Stable identifier for transport-scoped continuity state.
+    pub continuity_key: Option<String>,
+    /// Provider-specific response continuity handle from the previous turn.
+    pub previous_response_id: Option<String>,
 }
 
 /// A response from an LLM completion.
@@ -78,6 +82,8 @@ pub struct CompletionResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token usage statistics.
     pub usage: TokenUsage,
+    /// Provider-specific response continuity handle for the current turn.
+    pub response_id: Option<String>,
 }
 
 impl CompletionResponse {
@@ -226,6 +232,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
             usage: TokenUsage::default(),
+            response_id: None,
         };
         assert_eq!(response.text(), "Hello world!");
     }
@@ -261,6 +268,7 @@ mod tests {
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage {
                     input_tokens: 10,
+                    cached_input_tokens: 0,
                     output_tokens: 5,
                 },
             },
@@ -289,8 +297,10 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 5,
+                        cached_input_tokens: 0,
                         output_tokens: 3,
                     },
+                    response_id: None,
                 })
             }
         }
@@ -305,6 +315,8 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
+            continuity_key: None,
+            previous_response_id: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

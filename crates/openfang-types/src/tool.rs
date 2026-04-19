@@ -249,7 +249,13 @@ fn try_flatten_any_of(any_of: &serde_json::Value) -> Option<Vec<(String, serde_j
 
     for item in items {
         let obj = item.as_object()?;
-        let type_val = obj.get("type")?.as_str()?;
+        let type_val = obj.get("type").and_then(|v| v.as_str()).or_else(|| {
+            if obj.get("const").map(|v| v.is_null()).unwrap_or(false) {
+                Some("null")
+            } else {
+                None
+            }
+        })?;
 
         if type_val == "null" {
             has_null = true;
@@ -280,6 +286,15 @@ fn try_flatten_any_of(any_of: &serde_json::Value) -> Option<Vec<(String, serde_j
         if has_null {
             result.push(("nullable".to_string(), serde_json::Value::Bool(true)));
         }
+        return Some(result);
+    }
+
+    if has_null && !types.is_empty() {
+        let mut result = vec![(
+            "type".to_string(),
+            serde_json::Value::String(types[0].clone()),
+        )];
+        result.push(("nullable".to_string(), serde_json::Value::Bool(true)));
         return Some(result);
     }
 
@@ -360,6 +375,47 @@ mod tests {
         // Gemini rejects type arrays — should flatten to first type
         assert_eq!(value_prop["type"], "string");
         assert!(value_prop.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_normalize_schema_flattens_anyof_multi_type_nullable() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "anyOf": [
+                        { "type": "integer" },
+                        { "type": "string" },
+                        { "type": "null" }
+                    ]
+                }
+            }
+        });
+        let result = normalize_schema_for_provider(&schema, "openai");
+        let limit_prop = &result["properties"]["limit"];
+        assert_eq!(limit_prop["type"], "integer");
+        assert_eq!(limit_prop["nullable"], true);
+        assert!(limit_prop.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_normalize_schema_flattens_anyof_const_null() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cursor": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "const": null }
+                    ]
+                }
+            }
+        });
+        let result = normalize_schema_for_provider(&schema, "openai");
+        let cursor_prop = &result["properties"]["cursor"];
+        assert_eq!(cursor_prop["type"], "string");
+        assert_eq!(cursor_prop["nullable"], true);
+        assert!(cursor_prop.get("anyOf").is_none());
     }
 
     #[test]

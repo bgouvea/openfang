@@ -146,8 +146,10 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage {
                     input_tokens: 10,
+                    cached_input_tokens: 0,
                     output_tokens: 5,
                 },
+                response_id: None,
             })
         }
     }
@@ -161,6 +163,8 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
+            continuity_key: None,
+            previous_response_id: None,
         }
     }
 

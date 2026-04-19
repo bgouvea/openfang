@@ -18,12 +18,9 @@ use std::time::Duration;
 // ─── Constants ───────────────────────────────────────────────────────────────────
 
 // OpenAI Codex OAuth
-pub const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub const OPENAI_CODEX_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
-pub const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-pub const OPENAI_CODEX_DEVICE_URL: &str = "https://auth.openai.com/oauth/device/code";
-pub const OPENAI_CODEX_CALLBACK_URI: &str = "http://localhost:1455/auth/callback";
-pub const OPENAI_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub const OPENAI_CODEX_DEFAULT_ISSUER: &str = "https://auth.openai.com";
+pub const OPENAI_CODEX_DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const OPENAI_CODEX_DEFAULT_CALLBACK_URI: &str = "http://localhost:1455/auth/callback";
 
 // Gemini OAuth (requires GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET env vars)
 pub const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -49,6 +46,8 @@ pub const MINIMAX_OAUTH_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113"
 pub struct OAuthTokenSet {
     pub access_token: String,
     pub refresh_token: Option<String>,
+    pub id_token: Option<String>,
+    pub api_key: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub provider: String,
 }
@@ -71,6 +70,8 @@ impl OAuthTokenSet {
         Self {
             access_token: resp.access_token,
             refresh_token: resp.refresh_token,
+            id_token: resp.id_token,
+            api_key: None,
             expires_at,
             provider: provider.to_string(),
         }
@@ -118,6 +119,122 @@ pub enum DeviceFlowStatus {
 
 // ─── OpenAI Codex OAuth ───────────────────────────────────────────────────────
 
+#[derive(Debug, Deserialize)]
+struct CodexDeviceCodeStartResponse {
+    device_auth_id: String,
+    #[serde(alias = "usercode")]
+    user_code: String,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    interval: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexDeviceCodeStartRequest {
+    client_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexDeviceCodePollRequest<'a> {
+    device_auth_id: &'a str,
+    user_code: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDeviceCodePollResponse {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexApiKeyExchangeResponse {
+    access_token: String,
+}
+
+fn openai_codex_issuer() -> String {
+    std::env::var("OPENFANG_CODEX_OAUTH_ISSUER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| OPENAI_CODEX_DEFAULT_ISSUER.to_string())
+}
+
+fn openai_codex_client_id() -> String {
+    std::env::var("OPENFANG_CODEX_OAUTH_CLIENT_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| OPENAI_CODEX_DEFAULT_CLIENT_ID.to_string())
+}
+
+fn openai_codex_callback_uri() -> String {
+    std::env::var("OPENFANG_CODEX_OAUTH_CALLBACK_URI")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| OPENAI_CODEX_DEFAULT_CALLBACK_URI.to_string())
+}
+
+fn openai_codex_auth_url() -> String {
+    format!(
+        "{}/oauth/authorize",
+        openai_codex_issuer().trim_end_matches('/')
+    )
+}
+
+fn openai_codex_token_url() -> String {
+    format!(
+        "{}/oauth/token",
+        openai_codex_issuer().trim_end_matches('/')
+    )
+}
+
+fn openai_codex_device_usercode_url() -> String {
+    format!(
+        "{}/api/accounts/deviceauth/usercode",
+        openai_codex_issuer().trim_end_matches('/')
+    )
+}
+
+fn openai_codex_device_token_url() -> String {
+    format!(
+        "{}/api/accounts/deviceauth/token",
+        openai_codex_issuer().trim_end_matches('/')
+    )
+}
+
+fn openai_codex_device_callback_uri() -> String {
+    format!(
+        "{}/deviceauth/callback",
+        openai_codex_issuer().trim_end_matches('/')
+    )
+}
+
+fn openai_codex_verification_url() -> String {
+    format!(
+        "{}/codex/device",
+        openai_codex_issuer().trim_end_matches('/')
+    )
+}
+
+fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| serde::de::Error::custom("interval must be an unsigned integer"))
+            .map(Some),
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "unsupported interval value: {other}"
+        ))),
+    }
+}
+
 /// Start OpenAI Codex device code flow.
 pub async fn openai_codex_start_device_flow() -> Result<DeviceCodeResponse, String> {
     let client = Client::builder()
@@ -126,12 +243,12 @@ pub async fn openai_codex_start_device_flow() -> Result<DeviceCodeResponse, Stri
         .map_err(|e| format!("HTTP client error: {e}"))?;
 
     let resp = client
-        .post(OPENAI_CODEX_DEVICE_URL)
+        .post(openai_codex_device_usercode_url())
         .header("Accept", "application/json")
-        .form(&[
-            ("client_id", OPENAI_CODEX_CLIENT_ID),
-            ("scope", "openid profile email offline_access"),
-        ])
+        .header("Content-Type", "application/json")
+        .json(&CodexDeviceCodeStartRequest {
+            client_id: openai_codex_client_id(),
+        })
         .send()
         .await
         .map_err(|e| format!("Device code request failed: {e}"))?;
@@ -142,26 +259,36 @@ pub async fn openai_codex_start_device_flow() -> Result<DeviceCodeResponse, Stri
         return Err(format!("Device code request returned {status}: {body}"));
     }
 
-    resp.json::<DeviceCodeResponse>()
+    let raw = resp
+        .json::<CodexDeviceCodeStartResponse>()
         .await
-        .map_err(|e| format!("Failed to parse device code response: {e}"))
+        .map_err(|e| format!("Failed to parse device code response: {e}"))?;
+
+    Ok(DeviceCodeResponse {
+        device_code: raw.device_auth_id,
+        user_code: raw.user_code,
+        verification_uri: openai_codex_verification_url(),
+        verification_uri_complete: None,
+        expires_in: 15 * 60,
+        interval: raw.interval.or(Some(5)),
+    })
 }
 
 /// Poll OpenAI Codex device flow.
-pub async fn openai_codex_poll_device_flow(device_code: &str) -> DeviceFlowStatus {
+pub async fn openai_codex_poll_device_flow(device_code: &str, user_code: &str) -> DeviceFlowStatus {
     let client = match Client::builder().timeout(Duration::from_secs(15)).build() {
         Ok(c) => c,
         Err(e) => return DeviceFlowStatus::Error(format!("HTTP client error: {e}")),
     };
 
     let resp = match client
-        .post(OPENAI_CODEX_TOKEN_URL)
+        .post(openai_codex_device_token_url())
         .header("Accept", "application/json")
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("device_code", device_code),
-            ("client_id", OPENAI_CODEX_CLIENT_ID),
-        ])
+        .header("Content-Type", "application/json")
+        .json(&CodexDeviceCodePollRequest {
+            device_auth_id: device_code,
+            user_code,
+        })
         .send()
         .await
     {
@@ -169,48 +296,69 @@ pub async fn openai_codex_poll_device_flow(device_code: &str) -> DeviceFlowStatu
         Err(e) => return DeviceFlowStatus::Error(format!("Token poll failed: {e}")),
     };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
+    let status = resp.status();
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
+        return DeviceFlowStatus::Pending;
+    }
+    if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        if let Ok(err) = serde_json::from_str::<serde_json::Value>(&body) {
-            if let Some(error) = err.get("error").and_then(|v| v.as_str()) {
-                return match error {
-                    "authorization_pending" => DeviceFlowStatus::Pending,
-                    "slow_down" => {
-                        let interval = err.get("interval").and_then(|v| v.as_u64()).unwrap_or(10);
-                        DeviceFlowStatus::SlowDown {
-                            new_interval: interval,
-                        }
-                    }
-                    "expired_token" => DeviceFlowStatus::Expired,
-                    "access_denied" => DeviceFlowStatus::AccessDenied,
-                    _ => DeviceFlowStatus::Error(error.to_string()),
-                };
-            }
-        }
         return DeviceFlowStatus::Error(format!("HTTP {status}: {body}"));
     }
 
-    match resp.json::<TokenResponse>().await {
-        Ok(tokens) => DeviceFlowStatus::Complete {
-            tokens: OAuthTokenSet::from_response(tokens, "openai-codex"),
-        },
-        Err(e) => DeviceFlowStatus::Error(format!("Failed to parse token response: {e}")),
+    let code_resp = match resp.json::<CodexDeviceCodePollResponse>().await {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return DeviceFlowStatus::Error(format!("Failed to parse device auth response: {e}"));
+        }
+    };
+
+    let mut tokens = match openai_codex_exchange_code_with_redirect(
+        &code_resp.authorization_code,
+        &code_resp.code_verifier,
+        &openai_codex_device_callback_uri(),
+    )
+    .await
+    {
+        Ok(tokens) => tokens,
+        Err(e) => return DeviceFlowStatus::Error(e),
+    };
+
+    let id_token = match tokens.id_token.clone() {
+        Some(id_token) if !id_token.is_empty() => id_token,
+        _ => return DeviceFlowStatus::Error("Codex token exchange did not return id_token".into()),
+    };
+
+    match openai_codex_obtain_api_key(&id_token).await {
+        Ok(api_key) => {
+            tokens.api_key = Some(api_key);
+            DeviceFlowStatus::Complete { tokens }
+        }
+        Err(e) => {
+            DeviceFlowStatus::Error(format!("Failed to exchange Codex token for API key: {e}"))
+        }
     }
 }
 
 /// Build OpenAI Codex authorization URL for PKCE flow.
-pub fn openai_codex_build_authorize_url(state: &str, code_challenge: &str) -> String {
+pub fn openai_codex_build_authorize_url(
+    state: &str,
+    code_challenge: &str,
+    redirect_uri: &str,
+) -> String {
     let params = [
         ("response_type", "code"),
-        ("client_id", OPENAI_CODEX_CLIENT_ID),
-        ("redirect_uri", OPENAI_CODEX_CALLBACK_URI),
-        ("scope", "openid profile email offline_access"),
+        ("client_id", &openai_codex_client_id()),
+        ("redirect_uri", redirect_uri),
+        (
+            "scope",
+            "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        ),
         ("code_challenge", code_challenge),
         ("code_challenge_method", "S256"),
         ("state", state),
         ("codex_cli_simplified_flow", "true"),
         ("id_token_add_organizations", "true"),
+        ("originator", "codex_cli_rs"),
     ];
 
     let encoded: Vec<String> = params
@@ -218,7 +366,7 @@ pub fn openai_codex_build_authorize_url(state: &str, code_challenge: &str) -> St
         .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
         .collect();
 
-    format!("{}?{}", OPENAI_CODEX_AUTH_URL, encoded.join("&"))
+    format!("{}?{}", openai_codex_auth_url(), encoded.join("&"))
 }
 
 /// Exchange authorization code for tokens.
@@ -226,18 +374,35 @@ pub async fn openai_codex_exchange_code(
     code: &str,
     code_verifier: &str,
 ) -> Result<OAuthTokenSet, String> {
+    openai_codex_exchange_code_with_redirect(code, code_verifier, &openai_codex_callback_uri())
+        .await
+}
+
+pub async fn openai_codex_exchange_code_for_redirect(
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+) -> Result<OAuthTokenSet, String> {
+    openai_codex_exchange_code_with_redirect(code, code_verifier, redirect_uri).await
+}
+
+async fn openai_codex_exchange_code_with_redirect(
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+) -> Result<OAuthTokenSet, String> {
     let client = Client::new();
 
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
-        ("client_id", OPENAI_CODEX_CLIENT_ID),
-        ("redirect_uri", OPENAI_CODEX_CALLBACK_URI),
+        ("client_id", &openai_codex_client_id()),
+        ("redirect_uri", redirect_uri),
         ("code_verifier", code_verifier),
     ];
 
     let resp = client
-        .post(OPENAI_CODEX_TOKEN_URL)
+        .post(openai_codex_token_url())
         .form(&form)
         .send()
         .await
@@ -254,7 +419,7 @@ pub async fn openai_codex_exchange_code(
         .await
         .map_err(|e| format!("Failed to parse token response: {e}"))?;
 
-    Ok(OAuthTokenSet::from_response(tokens, "openai-codex"))
+    Ok(OAuthTokenSet::from_response(tokens, "codex"))
 }
 
 /// Refresh OpenAI Codex access token.
@@ -264,11 +429,11 @@ pub async fn openai_codex_refresh_token(refresh_token: &str) -> Result<OAuthToke
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
-        ("client_id", OPENAI_CODEX_CLIENT_ID),
+        ("client_id", &openai_codex_client_id()),
     ];
 
     let resp = client
-        .post(OPENAI_CODEX_TOKEN_URL)
+        .post(openai_codex_token_url())
         .form(&form)
         .send()
         .await
@@ -285,7 +450,50 @@ pub async fn openai_codex_refresh_token(refresh_token: &str) -> Result<OAuthToke
         .await
         .map_err(|e| format!("Failed to parse token response: {e}"))?;
 
-    Ok(OAuthTokenSet::from_response(tokens, "openai-codex"))
+    Ok(OAuthTokenSet::from_response(tokens, "codex"))
+}
+
+/// Exchange a Codex ChatGPT id_token for an OpenAI API-key-style access token.
+pub async fn openai_codex_obtain_api_key(id_token: &str) -> Result<String, String> {
+    let client = Client::new();
+
+    let form = [
+        (
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+        ),
+        ("client_id", &openai_codex_client_id()),
+        ("requested_token", "openai-api-key"),
+        ("subject_token", id_token),
+        (
+            "subject_token_type",
+            "urn:ietf:params:oauth:token-type:id_token",
+        ),
+    ];
+
+    let resp = client
+        .post(openai_codex_token_url())
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("API key exchange failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("API key exchange failed ({status}): {body}"));
+    }
+
+    let tokens: CodexApiKeyExchangeResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse API key exchange response: {e}"))?;
+
+    if tokens.access_token.trim().is_empty() {
+        return Err("API key exchange returned an empty access token".into());
+    }
+
+    Ok(tokens.access_token)
 }
 
 // ─── Gemini OAuth ───────────────────────────────────────────────────────────────
@@ -459,6 +667,8 @@ pub fn read_qwen_credentials() -> Option<OAuthTokenSet> {
     Some(OAuthTokenSet {
         access_token: creds.access_token,
         refresh_token: creds.refresh_token,
+        id_token: None,
+        api_key: None,
         expires_at,
         provider: "qwen-oauth".to_string(),
     })
@@ -630,8 +840,8 @@ mod tests {
 
     #[test]
     fn test_openai_constants() {
-        assert!(OPENAI_CODEX_AUTH_URL.starts_with("https://"));
-        assert!(OPENAI_CODEX_TOKEN_URL.starts_with("https://"));
+        assert!(openai_codex_auth_url().starts_with("https://"));
+        assert!(openai_codex_token_url().starts_with("https://"));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 use crate::registry::AgentRegistry;
 use chrono::Utc;
 use dashmap::DashMap;
-use openfang_types::agent::{AgentId, AgentState};
+use openfang_types::agent::{AgentId, AgentState, ScheduleMode};
 use tracing::{debug, warn};
 
 /// Default heartbeat check interval (seconds).
@@ -149,13 +149,25 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
 
         let inactive_secs = (now - entry_ref.last_active).num_seconds();
 
-        // Determine timeout: use agent's autonomous config if set, else default
-        let timeout_secs = entry_ref
-            .manifest
-            .autonomous
-            .as_ref()
-            .map(|a| a.heartbeat_interval_secs * UNRESPONSIVE_MULTIPLIER)
-            .unwrap_or(config.default_timeout_secs) as i64;
+        // Determine timeout:
+        // - Continuous/periodic/proactive agents use their autonomous heartbeat interval
+        //   because they run in the background and need tighter liveness checks.
+        // - Reactive agents can spend 1-3 minutes inside a user-triggered LLM/tool loop,
+        //   so we keep the more forgiving global default to avoid false crashes.
+        let schedule_uses_background_heartbeat = matches!(
+            entry_ref.manifest.schedule,
+            ScheduleMode::Continuous { .. } | ScheduleMode::Periodic { .. } | ScheduleMode::Proactive { .. }
+        );
+        let timeout_secs = if schedule_uses_background_heartbeat {
+            entry_ref
+                .manifest
+                .autonomous
+                .as_ref()
+                .map(|a| a.heartbeat_interval_secs * UNRESPONSIVE_MULTIPLIER)
+                .unwrap_or(config.default_timeout_secs)
+        } else {
+            config.default_timeout_secs
+        } as i64;
 
         // --- Skip idle agents that have never genuinely processed a message ---
         //

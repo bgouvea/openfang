@@ -188,6 +188,8 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
+            continuity_key: None,
+            previous_response_id: None,
         }
     }
 

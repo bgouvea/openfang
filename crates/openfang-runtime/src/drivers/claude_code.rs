@@ -428,8 +428,10 @@ impl LlmDriver for ClaudeCodeDriver {
                 tool_calls: Vec::new(),
                 usage: TokenUsage {
                     input_tokens: usage.input_tokens,
+                    cached_input_tokens: 0,
                     output_tokens: usage.output_tokens,
                 },
+                response_id: None,
             });
         }
 
@@ -444,8 +446,10 @@ impl LlmDriver for ClaudeCodeDriver {
             tool_calls: Vec::new(),
             usage: TokenUsage {
                 input_tokens: 0,
+                cached_input_tokens: 0,
                 output_tokens: 0,
             },
+            response_id: None,
         })
     }
 
@@ -514,6 +518,7 @@ impl LlmDriver for ClaudeCodeDriver {
         let mut full_text = String::new();
         let mut final_usage = TokenUsage {
             input_tokens: 0,
+            cached_input_tokens: 0,
             output_tokens: 0,
         };
 
@@ -566,6 +571,7 @@ impl LlmDriver for ClaudeCodeDriver {
                                 if let Some(usage) = event.usage {
                                     final_usage = TokenUsage {
                                         input_tokens: usage.input_tokens,
+                                        cached_input_tokens: 0,
                                         output_tokens: usage.output_tokens,
                                     };
                                 }
@@ -660,6 +666,7 @@ impl LlmDriver for ClaudeCodeDriver {
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
             usage: final_usage,
+            response_id: None,
         })
     }
 }
@@ -717,6 +724,8 @@ mod tests {
             temperature: 0.7,
             system: Some("You are helpful.".to_string()),
             thinking: None,
+            continuity_key: None,
+            previous_response_id: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);

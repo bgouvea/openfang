@@ -34,6 +34,7 @@ function agentsPage() {
       name: '',
       provider: 'groq',
       model: 'llama-3.3-70b-versatile',
+      reasoningEffort: '',
       systemPrompt: 'You are a helpful assistant.',
       profile: 'full',
       caps: { memory_read: true, memory_write: true, network: false, shell: false, agent_spawn: false }
@@ -42,6 +43,8 @@ function agentsPage() {
     // -- Multi-step wizard state --
     spawnProviders: [],       // populated from /api/providers on wizard open
     spawnProvidersLoading: false,
+    catalogModels: [],
+    catalogModelsLoading: false,
     spawnStep: 1,
     spawnIdentity: { emoji: '', color: '#FF5C00', archetype: '' },
     selectedPreset: '',
@@ -216,6 +219,7 @@ function agentsPage() {
       try {
         await Alpine.store('app').refreshAgents();
         await this.loadTemplates();
+        await this.loadModelCatalog();
         this.loadPersonalityPresets();
         this.loadProfileDescriptions();
       } catch(e) {
@@ -241,10 +245,74 @@ function agentsPage() {
       this.loadError = '';
       try {
         await Alpine.store('app').refreshAgents();
+        await this.loadModelCatalog();
       } catch(e) {
         this.loadError = e.message || 'Could not load agents.';
       }
       this.loading = false;
+    },
+
+    async loadModelCatalog() {
+      this.catalogModelsLoading = true;
+      try {
+        var data = await OpenFangAPI.get('/api/models');
+        this.catalogModels = data.models || [];
+      } catch(e) {
+        this.catalogModels = [];
+      }
+      this.catalogModelsLoading = false;
+    },
+
+    modelsForProvider(providerName) {
+      if (!providerName) return [];
+      return this.catalogModels
+        .filter(function(model) { return model.provider === providerName; })
+        .sort(function(a, b) {
+          return (a.display_name || a.id).localeCompare(b.display_name || b.id);
+        });
+    },
+
+    get spawnProviderModels() {
+      return this.modelsForProvider(this.spawnForm.provider);
+    },
+
+    get detailProviderModels() {
+      return this.detailAgent ? this.modelsForProvider(this.detailAgent.model_provider) : [];
+    },
+
+    reasoningEffortOptions() {
+      return [
+        { value: '', label: 'Provider default' },
+        { value: 'none', label: 'None' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High' },
+        { value: 'xhigh', label: 'XHigh' }
+      ];
+    },
+
+    providerSupportsReasoningEffort(providerName) {
+      return providerName === 'codex';
+    },
+
+    formatReasoningEffort(value) {
+      if (!value) return 'Provider default';
+      if (value === 'xhigh') return 'XHigh';
+      return value.charAt(0).toUpperCase() + value.slice(1);
+    },
+
+    syncSpawnModelSelection() {
+      var available = this.spawnProviderModels;
+      if (!available.length) return;
+      var current = this.spawnForm.model;
+      var matched = available.find(function(model) {
+        return model.id === current || model.id.split('/').slice(1).join('/') === current;
+      });
+      if (matched) {
+        this.spawnForm.model = matched.id;
+      } else {
+        this.spawnForm.model = available[0].id;
+      }
     },
 
     async loadTemplates() {
@@ -340,6 +408,7 @@ function agentsPage() {
     async showDetail(agent) {
       this.detailAgent = agent;
       this.detailAgent._fallbacks = [];
+      this.detailAgent.reasoning_effort = ((agent.model || {}).reasoning_effort) || '';
       this.detailTab = 'info';
       this.agentFiles = [];
       this.editingFile = null;
@@ -352,13 +421,16 @@ function agentsPage() {
         emoji: (agent.identity && agent.identity.emoji) || '',
         color: (agent.identity && agent.identity.color) || '#FF5C00',
         archetype: (agent.identity && agent.identity.archetype) || '',
-        vibe: (agent.identity && agent.identity.vibe) || ''
+        vibe: (agent.identity && agent.identity.vibe) || '',
+        reasoning_effort: ''
       };
       this.showDetailModal = true;
       // Fetch full agent detail to get fallback_models
       try {
         var full = await OpenFangAPI.get('/api/agents/' + agent.id);
         this.detailAgent._fallbacks = full.fallback_models || [];
+        this.detailAgent.reasoning_effort = ((full.model || {}).reasoning_effort) || '';
+        this.configForm.reasoning_effort = ((full.model || {}).reasoning_effort) || '';
       } catch(e) { /* ignore */ }
     },
 
@@ -406,6 +478,7 @@ function agentsPage() {
       this.spawnForm.name = '';
       this.spawnForm.provider = 'default';
       this.spawnForm.model = 'default';
+      this.spawnForm.reasoningEffort = '';
       this.spawnForm.systemPrompt = 'You are a helpful assistant.';
       this.spawnForm.profile = 'full';
       // Fetch status defaults and dynamic provider list concurrently
@@ -413,13 +486,17 @@ function agentsPage() {
       try {
         var results = await Promise.all([
           OpenFangAPI.get('/api/status').catch(function() { return {}; }),
-          OpenFangAPI.get('/api/providers').catch(function() { return { providers: [] }; })
+          OpenFangAPI.get('/api/providers').catch(function() { return { providers: [] }; }),
+          OpenFangAPI.get('/api/models').catch(function() { return { models: [] }; })
         ]);
         var status = results[0];
         var provData = results[1];
+        var modelData = results[2];
         if (status.default_provider) this.spawnForm.provider = status.default_provider;
         if (status.default_model) this.spawnForm.model = status.default_model;
         this.spawnProviders = provData.providers || [];
+        this.catalogModels = modelData.models || this.catalogModels;
+        this.syncSpawnModelSelection();
       } catch(e) {
         this.spawnProviders = [];
       }
@@ -456,6 +533,7 @@ function agentsPage() {
       lines.push('', '[model]');
       lines.push('provider = "' + f.provider + '"');
       lines.push('model = "' + f.model + '"');
+      if (f.reasoningEffort) lines.push('reasoning_effort = "' + f.reasoningEffort + '"');
       lines.push('system_prompt = """\n' + tomlMultilineEscape(f.systemPrompt) + '\n"""');
       if (f.profile === 'custom') {
         lines.push('', '[capabilities]');
@@ -575,6 +653,7 @@ function agentsPage() {
       this.configSaving = true;
       try {
         await OpenFangAPI.patch('/api/agents/' + this.detailAgent.id + '/config', this.configForm);
+        this.detailAgent.reasoning_effort = this.configForm.reasoning_effort || '';
         OpenFangToast.success('Config updated');
         await Alpine.store('app').refreshAgents();
       } catch(e) {

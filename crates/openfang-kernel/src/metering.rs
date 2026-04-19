@@ -536,6 +536,7 @@ mod tests {
                 agent_id,
                 model: "claude-haiku".to_string(),
                 input_tokens: 100,
+                cached_input_tokens: 0,
                 output_tokens: 50,
                 cost_usd: 0.001,
                 tool_calls: 0,
@@ -559,6 +560,7 @@ mod tests {
                 agent_id,
                 model: "claude-sonnet".to_string(),
                 input_tokens: 10000,
+                cached_input_tokens: 0,
                 output_tokens: 5000,
                 cost_usd: 0.05,
                 tool_calls: 0,
@@ -586,6 +588,7 @@ mod tests {
                 agent_id,
                 model: "claude-opus".to_string(),
                 input_tokens: 100000,
+                cached_input_tokens: 0,
                 output_tokens: 50000,
                 cost_usd: 100.0,
                 tool_calls: 0,
@@ -796,6 +799,7 @@ mod tests {
                 agent_id,
                 model: "haiku".to_string(),
                 input_tokens: 500,
+                cached_input_tokens: 120,
                 output_tokens: 200,
                 cost_usd: 0.005,
                 tool_calls: 3,
@@ -805,5 +809,6 @@ mod tests {
         let summary = engine.get_summary(Some(agent_id)).unwrap();
         assert_eq!(summary.call_count, 1);
         assert_eq!(summary.total_input_tokens, 500);
+        assert_eq!(summary.total_cached_input_tokens, 120);
     }
 }

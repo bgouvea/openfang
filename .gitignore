@@ -31,6 +31,11 @@ collector_knowledge_base.json
 predictions_database.json
 prediction_report_*.md
 BUILD_LOG.md
+*.log
+*.pid
+*.out
+*.tmp
+*.bak
 
 # OS
 .DS_Store
@@ -45,6 +50,29 @@ Thumbs.db
 *.swo
 *~
 .serena/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local OpenFang / agent workspace state
+# Keep versionable definitions such as agent.toml, workflow JSON, TOOLS.md,
+# SKILL.md/skill.toml, and example configs out of these broad runtime folders.
+**/workspaces/*/memory/
+**/workspaces/*/logs/
+**/workspaces/*/sessions/
+**/workspaces/*/data/
+**/workspaces/*/output/
+**/workspaces/*/AGENT.json
+**/workspaces/*/BOOTSTRAP.md
+**/workspaces/*/IDENTITY.md
+**/workspaces/*/USER.md
+**/workspaces/*/MEMORY.md
+**/backups/
+
+# Local runtime env/state files
+secrets.env
+openfang.log
+openfang.pid
 
 # Personal deploy scripts
 scripts/deploy-remote.sh
