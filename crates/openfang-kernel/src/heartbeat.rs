@@ -156,7 +156,9 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
         //   so we keep the more forgiving global default to avoid false crashes.
         let schedule_uses_background_heartbeat = matches!(
             entry_ref.manifest.schedule,
-            ScheduleMode::Continuous { .. } | ScheduleMode::Periodic { .. } | ScheduleMode::Proactive { .. }
+            ScheduleMode::Continuous { .. }
+                | ScheduleMode::Periodic { .. }
+                | ScheduleMode::Proactive { .. }
         );
         let timeout_secs = if schedule_uses_background_heartbeat {
             entry_ref

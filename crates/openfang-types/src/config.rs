@@ -1168,9 +1168,45 @@ pub struct KernelConfig {
     /// Defaults to `~/.openfang/workflows`. Set to empty string to disable.
     #[serde(default)]
     pub workflows_dir: Option<PathBuf>,
+    /// Session compaction settings.
+    #[serde(default)]
+    pub compaction: CompactionSettings,
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+}
+
+/// Session compaction settings exposed in `[compaction]` config section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionSettings {
+    /// Enable automatic session compaction.
+    pub enabled: bool,
+    /// Compact when session message count exceeds this.
+    pub threshold: usize,
+    /// Number of recent messages preserved verbatim after compaction.
+    pub keep_recent: usize,
+    /// Maximum tokens for the compaction summary call.
+    pub max_summary_tokens: u32,
+    /// Trigger token-based compaction when estimated input exceeds this ratio
+    /// of the model context window. Ignored when `auto_compact_token_limit` is set.
+    pub token_threshold_ratio: f64,
+    /// Explicit token limit for auto-compaction, similar to Codex IDE/CLI.
+    /// When set, compaction triggers once estimated prompt+messages+tools exceed this limit.
+    pub auto_compact_token_limit: Option<usize>,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: 80,
+            keep_recent: 20,
+            max_summary_tokens: 1024,
+            token_threshold_ratio: 0.55,
+            auto_compact_token_limit: None,
+        }
+    }
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1407,6 +1443,7 @@ impl Default for KernelConfig {
             oauth: OAuthConfig::default(),
             auth: AuthConfig::default(),
             workflows_dir: None,
+            compaction: CompactionSettings::default(),
             heartbeat: HeartbeatSettings::default(),
         }
     }

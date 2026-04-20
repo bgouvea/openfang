@@ -1911,47 +1911,6 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
-        let needs_compact = {
-            use openfang_runtime::compactor::{
-                estimate_token_count, needs_compaction as check_compact,
-                needs_compaction_by_tokens, CompactionConfig,
-            };
-            let config = CompactionConfig::default();
-            let by_messages = check_compact(&session, &config);
-            let estimated = estimate_token_count(
-                &session.messages,
-                Some(&entry.manifest.model.system_prompt),
-                None,
-            );
-            let by_tokens = needs_compaction_by_tokens(estimated, &config);
-            if by_tokens && !by_messages {
-                info!(
-                    agent_id = %agent_id,
-                    estimated_tokens = estimated,
-                    messages = session.messages.len(),
-                    "Token-based compaction triggered (messages below threshold but tokens above)"
-                );
-            }
-            let by_quota = if let Some(headroom) = self.scheduler.token_headroom(agent_id) {
-                let threshold = (headroom as f64 * 0.8) as u64;
-                if estimated as u64 > threshold && session.messages.len() > 4 {
-                    info!(
-                        agent_id = %agent_id,
-                        estimated_tokens = estimated,
-                        quota_headroom = headroom,
-                        "Quota-headroom compaction triggered (session would consume >80% of remaining quota)"
-                    );
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            by_messages || by_tokens || by_quota
-        };
-
         let driver = self.resolve_driver(&entry.manifest)?;
 
         // Look up model's actual context window from the catalog
@@ -1959,7 +1918,6 @@ impl OpenFangKernel {
             cat.find_model(&entry.manifest.model.model)
                 .map(|m| m.context_window as usize)
         });
-
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
 
@@ -2115,6 +2073,45 @@ impl OpenFangKernel {
             }
         }
 
+        let needs_compact = {
+            use openfang_runtime::compactor::{
+                estimate_token_count, needs_compaction as check_compact, needs_compaction_by_tokens,
+            };
+            let config = self.build_compaction_config(ctx_window);
+            let by_messages = check_compact(&session, &config);
+            let estimated = estimate_token_count(
+                &session.messages,
+                Some(&manifest.model.system_prompt),
+                Some(&tools),
+            );
+            let by_tokens = needs_compaction_by_tokens(estimated, &config);
+            if by_tokens && !by_messages {
+                info!(
+                    agent_id = %agent_id,
+                    estimated_tokens = estimated,
+                    messages = session.messages.len(),
+                    "Token-based compaction triggered with effective prompt+tools"
+                );
+            }
+            let by_quota = if let Some(headroom) = self.scheduler.token_headroom(agent_id) {
+                let threshold = (headroom as f64 * 0.8) as u64;
+                if estimated as u64 > threshold && session.messages.len() > config.keep_recent {
+                    info!(
+                        agent_id = %agent_id,
+                        estimated_tokens = estimated,
+                        quota_headroom = headroom,
+                        "Quota-headroom compaction triggered"
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            self.config.compaction.enabled && (by_messages || by_tokens || by_quota)
+        };
+
         let memory = Arc::clone(&self.memory);
         // Build link context from user message (auto-extract URLs for the agent)
         let message_owned = if let Some(link_ctx) =
@@ -2130,7 +2127,15 @@ impl OpenFangKernel {
             // Auto-compact if the session is large before running the loop
             if needs_compact {
                 info!(agent_id = %agent_id, messages = session.messages.len(), "Auto-compacting session");
-                match kernel_clone.compact_agent_session(agent_id).await {
+                match kernel_clone
+                    .compact_agent_session_with_context(
+                        agent_id,
+                        Some(&manifest.model.system_prompt),
+                        Some(&tools),
+                        ctx_window,
+                    )
+                    .await
+                {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         // Reload the session after compaction
@@ -2269,15 +2274,31 @@ impl OpenFangKernel {
                     // trigger compaction in background for the next call.
                     {
                         use openfang_runtime::compactor::{
-                            estimate_token_count, needs_compaction_by_tokens, CompactionConfig,
+                            estimate_token_count, needs_compaction_by_tokens,
                         };
-                        let config = CompactionConfig::default();
-                        let estimated = estimate_token_count(&session.messages, None, None);
-                        if needs_compaction_by_tokens(estimated, &config) {
+                        let config = kernel_clone.build_compaction_config(ctx_window);
+                        let estimated = estimate_token_count(
+                            &session.messages,
+                            Some(&manifest.model.system_prompt),
+                            Some(&tools),
+                        );
+                        if kernel_clone.config.compaction.enabled
+                            && needs_compaction_by_tokens(estimated, &config)
+                        {
                             let kc = kernel_clone.clone();
+                            let system_prompt = manifest.model.system_prompt.clone();
+                            let tools = tools.clone();
                             tokio::spawn(async move {
                                 info!(agent_id = %agent_id, estimated_tokens = estimated, "Post-loop compaction triggered");
-                                if let Err(e) = kc.compact_agent_session(agent_id).await {
+                                if let Err(e) = kc
+                                    .compact_agent_session_with_context(
+                                        agent_id,
+                                        Some(&system_prompt),
+                                        Some(&tools),
+                                        ctx_window,
+                                    )
+                                    .await
+                                {
                                     warn!(agent_id = %agent_id, "Post-loop compaction failed: {e}");
                                 }
                             });
@@ -2476,42 +2497,6 @@ impl OpenFangKernel {
                 context_window_tokens: 0,
                 label: None,
             });
-
-        // Pre-emptive compaction: compact before LLM call if session is large or quota headroom is low
-        {
-            use openfang_runtime::compactor::{
-                estimate_token_count, needs_compaction as check_compact,
-                needs_compaction_by_tokens, CompactionConfig,
-            };
-            let config = CompactionConfig::default();
-            let by_messages = check_compact(&session, &config);
-            let estimated = estimate_token_count(
-                &session.messages,
-                Some(&entry.manifest.model.system_prompt),
-                None,
-            );
-            let by_tokens = needs_compaction_by_tokens(estimated, &config);
-            let by_quota = if let Some(headroom) = self.scheduler.token_headroom(agent_id) {
-                let threshold = (headroom as f64 * 0.8) as u64;
-                estimated as u64 > threshold && session.messages.len() > 4
-            } else {
-                false
-            };
-            if by_messages || by_tokens || by_quota {
-                info!(agent_id = %agent_id, messages = session.messages.len(), estimated_tokens = estimated, "Pre-emptive compaction before LLM call");
-                match self.compact_agent_session(agent_id).await {
-                    Ok(msg) => {
-                        info!(agent_id = %agent_id, "{msg}");
-                        if let Ok(Some(reloaded)) = self.memory.get_session(session.id) {
-                            session = reloaded;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(agent_id = %agent_id, "Pre-emptive compaction failed: {e}");
-                    }
-                }
-            }
-        }
 
         let messages_before = session.messages.len();
 
@@ -2733,6 +2718,54 @@ impl OpenFangKernel {
             cat.find_model(&manifest.model.model)
                 .map(|m| m.context_window as usize)
         });
+
+        // Pre-emptive compaction with the effective prompt and effective tool list.
+        {
+            use openfang_runtime::compactor::{
+                estimate_token_count, needs_compaction as check_compact, needs_compaction_by_tokens,
+            };
+            let config = self.build_compaction_config(ctx_window);
+            let by_messages = check_compact(&session, &config);
+            let estimated = estimate_token_count(
+                &session.messages,
+                Some(&manifest.model.system_prompt),
+                Some(&tools),
+            );
+            let by_tokens = needs_compaction_by_tokens(estimated, &config);
+            let by_quota = if let Some(headroom) = self.scheduler.token_headroom(agent_id) {
+                let threshold = (headroom as f64 * 0.8) as u64;
+                estimated as u64 > threshold && session.messages.len() > config.keep_recent
+            } else {
+                false
+            };
+            if self.config.compaction.enabled && (by_messages || by_tokens || by_quota) {
+                info!(
+                    agent_id = %agent_id,
+                    messages = session.messages.len(),
+                    estimated_tokens = estimated,
+                    "Pre-emptive compaction before LLM call with effective prompt+tools"
+                );
+                match self
+                    .compact_agent_session_with_context(
+                        agent_id,
+                        Some(&manifest.model.system_prompt),
+                        Some(&tools),
+                        ctx_window,
+                    )
+                    .await
+                {
+                    Ok(msg) => {
+                        info!(agent_id = %agent_id, "{msg}");
+                        if let Ok(Some(reloaded)) = self.memory.get_session(session.id) {
+                            session = reloaded;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(agent_id = %agent_id, "Pre-emptive compaction failed: {e}");
+                    }
+                }
+            }
+        }
 
         // skill_snapshot was already built above (before tool list and prompt)
         // with bundled + global + workspace skills. Reuse it for the agent loop.
@@ -3352,7 +3385,36 @@ impl OpenFangKernel {
     /// Replaces the existing text-truncation compaction with an intelligent
     /// LLM-generated summary of older messages, keeping only recent messages.
     pub async fn compact_agent_session(&self, agent_id: AgentId) -> KernelResult<String> {
-        use openfang_runtime::compactor::{compact_session, needs_compaction, CompactionConfig};
+        self.compact_agent_session_with_context(agent_id, None, None, None)
+            .await
+    }
+
+    fn build_compaction_config(
+        &self,
+        context_window_tokens: Option<usize>,
+    ) -> openfang_runtime::compactor::CompactionConfig {
+        let mut config = openfang_runtime::compactor::CompactionConfig::default();
+        config.threshold = self.config.compaction.threshold;
+        config.keep_recent = self.config.compaction.keep_recent;
+        config.max_summary_tokens = self.config.compaction.max_summary_tokens;
+        config.token_threshold_ratio = self.config.compaction.token_threshold_ratio;
+        config.auto_compact_token_limit = self.config.compaction.auto_compact_token_limit;
+        if let Some(ctx_window) = context_window_tokens {
+            config.context_window_tokens = ctx_window;
+        }
+        config
+    }
+
+    async fn compact_agent_session_with_context(
+        &self,
+        agent_id: AgentId,
+        system_prompt: Option<&str>,
+        tools: Option<&[openfang_types::tool::ToolDefinition]>,
+        context_window_tokens: Option<usize>,
+    ) -> KernelResult<String> {
+        use openfang_runtime::compactor::{
+            compact_session, estimate_token_count, needs_compaction, needs_compaction_by_tokens,
+        };
 
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
@@ -3370,13 +3432,24 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        let config = CompactionConfig::default();
+        let model_context_window = context_window_tokens.or_else(|| {
+            self.model_catalog.read().ok().and_then(|cat| {
+                cat.find_model(&entry.manifest.model.model)
+                    .map(|m| m.context_window as usize)
+            })
+        });
+        let config = self.build_compaction_config(model_context_window);
+        let effective_system_prompt = system_prompt.unwrap_or(&entry.manifest.model.system_prompt);
+        let estimated_tokens =
+            estimate_token_count(&session.messages, Some(effective_system_prompt), tools);
+        let by_messages = needs_compaction(&session, &config);
+        let by_tokens = needs_compaction_by_tokens(estimated_tokens, &config);
 
-        if !needs_compaction(&session, &config) {
+        if !self.config.compaction.enabled || (!by_messages && !by_tokens) {
             return Ok(format!(
-                "No compaction needed ({} messages, threshold {})",
+                "No compaction needed ({} messages, ~{} tokens)",
                 session.messages.len(),
-                config.threshold
+                estimated_tokens
             ));
         }
 

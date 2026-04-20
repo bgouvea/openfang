@@ -16,11 +16,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -33,8 +33,7 @@ const KEEPALIVE_PING_TIMEOUT_REASON: &str = "keepalive ping timeout";
 
 type CodexWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-static WS_SESSIONS: LazyLock<DashMap<String, Arc<CodexWsSession>>> =
-    LazyLock::new(DashMap::new);
+static WS_SESSIONS: LazyLock<DashMap<String, Arc<CodexWsSession>>> = LazyLock::new(DashMap::new);
 
 #[derive(Clone, Debug, Default)]
 struct PendingToolCall {
@@ -192,19 +191,16 @@ impl CodexChatGPTWsDriver {
         let mut refreshed = false;
 
         loop {
-            let mut request = self
-                .websocket_url()
-                .into_client_request()
-                .map_err(|e| LlmError::Http(format!("Failed to build Codex websocket request: {e}")))?;
+            let mut request = self.websocket_url().into_client_request().map_err(|e| {
+                LlmError::Http(format!("Failed to build Codex websocket request: {e}"))
+            })?;
 
-            request.headers_mut().insert(
-                "originator",
-                HeaderValue::from_static(CODEX_ORIGINATOR),
-            );
-            request.headers_mut().insert(
-                "OpenAI-Beta",
-                HeaderValue::from_static(CODEX_WS_BETA),
-            );
+            request
+                .headers_mut()
+                .insert("originator", HeaderValue::from_static(CODEX_ORIGINATOR));
+            request
+                .headers_mut()
+                .insert("OpenAI-Beta", HeaderValue::from_static(CODEX_WS_BETA));
             request.headers_mut().insert(
                 "x-client-request-id",
                 HeaderValue::from_str(&session.session_id)
@@ -243,10 +239,7 @@ impl CodexChatGPTWsDriver {
                 Err(WsError::Http(response)) => {
                     return Err(LlmError::Api {
                         status: response.status().as_u16(),
-                        message: format!(
-                            "Codex websocket handshake failed: {}",
-                            response.status()
-                        ),
+                        message: format!("Codex websocket handshake failed: {}", response.status()),
                     });
                 }
                 Err(error) => {
@@ -391,14 +384,11 @@ impl CodexChatGPTWsDriver {
                 WsMessage::Text(text) => text.to_string(),
                 WsMessage::Binary(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                 WsMessage::Ping(payload) => {
-                    socket
-                        .send(WsMessage::Pong(payload))
-                        .await
-                        .map_err(|e| {
-                            LlmError::Http(format!(
-                                "Codex websocket failed to answer ping with pong: {e}"
-                            ))
-                        })?;
+                    socket.send(WsMessage::Pong(payload)).await.map_err(|e| {
+                        LlmError::Http(format!(
+                            "Codex websocket failed to answer ping with pong: {e}"
+                        ))
+                    })?;
                     continue;
                 }
                 WsMessage::Pong(_) => continue,
@@ -577,7 +567,8 @@ impl CodexChatGPTWsDriver {
                         {
                             response_id = Some(id.to_string());
                         }
-                        if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
+                        if let Some(error) = response.get("error").filter(|value| !value.is_null())
+                        {
                             return Err(LlmError::Api {
                                 status: 500,
                                 message: error.to_string(),
@@ -732,15 +723,16 @@ impl CodexChatGPTWsDriver {
             && transport.last_signature.as_ref() == Some(&signature)
             && incremental_messages(&request.messages).is_some();
 
-        let (body, signature) = self.build_request_payload(&request, &session, use_previous_response_id);
-        let payload = serde_json::to_string(&body)
-            .map_err(|e| LlmError::Parse(format!("Failed to encode Codex websocket request: {e}")))?;
+        let (body, signature) =
+            self.build_request_payload(&request, &session, use_previous_response_id);
+        let payload = serde_json::to_string(&body).map_err(|e| {
+            LlmError::Parse(format!("Failed to encode Codex websocket request: {e}"))
+        })?;
 
         let result = {
-            let socket = transport
-                .socket
-                .as_mut()
-                .ok_or_else(|| LlmError::Http("Codex websocket session not connected".to_string()))?;
+            let socket = transport.socket.as_mut().ok_or_else(|| {
+                LlmError::Http("Codex websocket session not connected".to_string())
+            })?;
             socket
                 .send(WsMessage::Text(payload.into()))
                 .await
@@ -787,8 +779,8 @@ impl CodexChatGPTWsDriver {
                     transport.last_response_id = None;
                     transport.last_signature = None;
                 }
-                let should_retry_clean = allow_recovery_retry
-                    && Self::is_missing_tool_output_error(&error);
+                let should_retry_clean =
+                    allow_recovery_retry && Self::is_missing_tool_output_error(&error);
                 drop(transport);
                 if should_retry_clean {
                     self.reset_session_for_key(&continuity_key);
@@ -817,10 +809,7 @@ impl LlmDriver for CodexChatGPTWsDriver {
     }
 }
 
-fn try_emit_stream_event(
-    tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
-    event: StreamEvent,
-) {
+fn try_emit_stream_event(tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>, event: StreamEvent) {
     let Some(tx) = tx else {
         return;
     };
@@ -866,12 +855,9 @@ fn incremental_can_use_previous_response_id(messages: &[Message]) -> bool {
 
 fn message_contains_tool_result(message: &Message) -> bool {
     match &message.content {
-        MessageContent::Blocks(blocks) => blocks.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::ToolResult { .. }
-            )
-        }),
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. })),
         _ => false,
     }
 }
@@ -941,7 +927,9 @@ fn build_message_items(messages: &[Message]) -> Vec<Value> {
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text, .. } => content.push(output_text_part(text)),
-                        ContentBlock::ToolUse { id, name, input, .. } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             let arguments =
                                 serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                             items.push(serde_json::json!({

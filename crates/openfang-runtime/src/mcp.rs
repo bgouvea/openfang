@@ -10,8 +10,8 @@
 use http::{HeaderName, HeaderValue};
 use openfang_types::tool::ToolDefinition;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ReadResourceRequestParams,
-    Resource, ResourceContents,
+    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation,
+    ReadResourceRequestParams, Resource, ResourceContents,
 };
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
@@ -574,7 +574,9 @@ fn sanitize_mcp_args_value(value: serde_json::Value) -> Option<serde_json::Value
                 .filter_map(sanitize_mcp_args_value)
                 .collect(),
         )),
-        serde_json::Value::Object(map) => Some(serde_json::Value::Object(sanitize_mcp_args_map(map))),
+        serde_json::Value::Object(map) => {
+            Some(serde_json::Value::Object(sanitize_mcp_args_map(map)))
+        }
         other => Some(other),
     }
 }

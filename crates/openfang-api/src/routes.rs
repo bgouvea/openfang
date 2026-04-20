@@ -9,6 +9,7 @@ use axum::Json;
 use axum::Router;
 use dashmap::DashMap;
 use openfang_channels::bridge::channel_command_specs;
+use openfang_kernel::error::KernelError;
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
@@ -338,6 +339,8 @@ pub async fn send_message(
     Path(id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> impl IntoResponse {
+    use openfang_runtime::llm_driver::StreamEvent;
+
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
@@ -380,18 +383,57 @@ pub async fn send_message(
     };
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    match state
-        .kernel
-        .send_message_with_handle_and_blocks(
+    let use_streaming_backend = content_blocks.is_none();
+
+    let result = if use_streaming_backend {
+        match state.kernel.send_message_streaming(
             agent_id,
             &req.message,
             Some(kernel_handle),
-            content_blocks,
             req.sender_id,
             req.sender_name,
-        )
-        .await
-    {
+            None,
+        ) {
+            Ok((mut rx, handle)) => {
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        StreamEvent::TextDelta { .. }
+                        | StreamEvent::ContentComplete { .. }
+                        | StreamEvent::ToolUseStart { .. }
+                        | StreamEvent::ToolUseEnd { .. }
+                        | StreamEvent::ToolExecutionResult { .. }
+                        | StreamEvent::PhaseChange { .. }
+                        | StreamEvent::ThinkingDelta { .. }
+                        | StreamEvent::ToolInputDelta { .. } => {}
+                    }
+                }
+
+                match handle.await {
+                    Ok(inner) => inner,
+                    Err(e) => Err(KernelError::OpenFang(
+                        openfang_types::error::OpenFangError::Internal(format!(
+                            "Streaming task join failed: {e}"
+                        )),
+                    )),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        state
+            .kernel
+            .send_message_with_handle_and_blocks(
+                agent_id,
+                &req.message,
+                Some(kernel_handle),
+                content_blocks,
+                req.sender_id,
+                req.sender_name,
+            )
+            .await
+    };
+
+    match result {
         Ok(result) => {
             // Strip <think>...</think> blocks from model output
             let cleaned = crate::ws::strip_think_tags(&result.response);
@@ -5329,20 +5371,19 @@ pub async fn usage_stats(State(state): State<Arc<AppState>>) -> impl IntoRespons
         .list()
         .iter()
         .map(|e| {
-            let summary =
-                state
-                    .kernel
-                    .memory
-                    .usage()
-                    .query_summary(Some(e.id))
-                    .unwrap_or(openfang_memory::usage::UsageSummary {
-                        total_input_tokens: 0,
-                        total_cached_input_tokens: 0,
-                        total_output_tokens: 0,
-                        total_cost_usd: 0.0,
-                        call_count: 0,
-                        total_tool_calls: 0,
-                    });
+            let summary = state
+                .kernel
+                .memory
+                .usage()
+                .query_summary(Some(e.id))
+                .unwrap_or(openfang_memory::usage::UsageSummary {
+                    total_input_tokens: 0,
+                    total_cached_input_tokens: 0,
+                    total_output_tokens: 0,
+                    total_cost_usd: 0.0,
+                    call_count: 0,
+                    total_tool_calls: 0,
+                });
             serde_json::json!({
                 "agent_id": e.id.to_string(),
                 "name": e.name,
@@ -6871,9 +6912,7 @@ pub async fn mcp_http(
                     for resource in server_resources {
                         let mut value = serde_json::to_value(resource).unwrap_or_default();
                         if let Some(obj) = value.as_object_mut() {
-                            let meta = obj
-                                .entry("_meta")
-                                .or_insert_with(|| serde_json::json!({}));
+                            let meta = obj.entry("_meta").or_insert_with(|| serde_json::json!({}));
                             if let Some(meta_obj) = meta.as_object_mut() {
                                 meta_obj.insert(
                                     "openfangServer".to_string(),
@@ -11300,9 +11339,8 @@ async fn bind_codex_callback_listener_with_retry() -> Result<tokio::net::TcpList
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        "Failed to bind Codex callback listener on 127.0.0.1:1455".to_string()
-    }))
+    Err(last_error
+        .unwrap_or_else(|| "Failed to bind Codex callback listener on 127.0.0.1:1455".to_string()))
 }
 
 fn codex_flow_cleanup() {

@@ -42,6 +42,8 @@ pub struct CompactionConfig {
     pub max_retries: u32,
     /// Trigger compaction when estimated tokens exceed this fraction of context_window_tokens.
     pub token_threshold_ratio: f64,
+    /// Explicit token limit for auto-compaction. When set, overrides ratio-based threshold.
+    pub auto_compact_token_limit: Option<usize>,
     /// Model context window size in tokens.
     pub context_window_tokens: usize,
 }
@@ -58,7 +60,8 @@ impl Default for CompactionConfig {
             summarization_overhead_tokens: 4096,
             max_chunk_chars: 80_000,
             max_retries: 3,
-            token_threshold_ratio: 0.7,
+            token_threshold_ratio: 0.55,
+            auto_compact_token_limit: None,
             context_window_tokens: 200_000,
         }
     }
@@ -124,7 +127,9 @@ pub fn estimate_token_count(
 ///
 /// Returns true if `estimated_tokens > context_window * token_threshold_ratio`.
 pub fn needs_compaction_by_tokens(estimated_tokens: usize, config: &CompactionConfig) -> bool {
-    let threshold = (config.context_window_tokens as f64 * config.token_threshold_ratio) as usize;
+    let threshold = config.auto_compact_token_limit.unwrap_or_else(|| {
+        (config.context_window_tokens as f64 * config.token_threshold_ratio) as usize
+    });
     estimated_tokens > threshold
 }
 

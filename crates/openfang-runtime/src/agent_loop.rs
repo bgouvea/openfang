@@ -112,15 +112,21 @@ fn store_previous_response_id(
         return;
     }
 
+    let key = codex_response_continuity_key(session);
     let Some(response_id) = response_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        if let Err(error) = memory.structured_delete(session.agent_id, &key) {
+            warn!(
+                session_id = %session.id,
+                agent_id = %session.agent_id,
+                "Failed to clear Codex previous_response_id: {error}"
+            );
+        }
         return;
     };
 
-    if let Err(error) = memory.structured_set(
-        session.agent_id,
-        &codex_response_continuity_key(session),
-        serde_json::json!(response_id),
-    ) {
+    if let Err(error) =
+        memory.structured_set(session.agent_id, &key, serde_json::json!(response_id))
+    {
         warn!(
             session_id = %session.id,
             agent_id = %session.agent_id,
@@ -191,6 +197,76 @@ pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
 
 /// Default context window size (tokens) for token-based trimming.
 const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
+
+fn live_compaction_config(context_window_tokens: usize) -> crate::compactor::CompactionConfig {
+    let mut config = crate::compactor::CompactionConfig::default();
+    config.context_window_tokens = context_window_tokens.max(1);
+    config.threshold = 80;
+    config.keep_recent = 20;
+    config.max_summary_tokens = 1024;
+    config.token_threshold_ratio = 0.55;
+    config
+}
+
+async fn maybe_compact_live_session(
+    manifest: &AgentManifest,
+    session: &mut Session,
+    memory: &MemorySubstrate,
+    driver: Arc<dyn LlmDriver>,
+    available_tools: &[ToolDefinition],
+    system_prompt: &str,
+    context_window_tokens: usize,
+    previous_response_id: &mut Option<String>,
+) -> OpenFangResult<bool> {
+    use crate::compactor::{
+        compact_session, estimate_token_count, needs_compaction, needs_compaction_by_tokens,
+    };
+
+    let config = live_compaction_config(context_window_tokens);
+    let estimated = estimate_token_count(
+        &session.messages,
+        Some(system_prompt),
+        Some(available_tools),
+    );
+    let should_compact =
+        needs_compaction(session, &config) || needs_compaction_by_tokens(estimated, &config);
+
+    if !should_compact || session.messages.len() <= config.keep_recent {
+        return Ok(false);
+    }
+
+    let model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+    let result = compact_session(driver, &model, session, &config)
+        .await
+        .map_err(|e| OpenFangError::Internal(format!("Live compaction failed: {e}")))?;
+
+    memory.store_llm_summary(
+        session.agent_id,
+        &result.summary,
+        result.kept_messages.clone(),
+    )?;
+    let (repaired_messages, _) =
+        crate::session_repair::validate_and_repair_with_stats(&result.kept_messages);
+    session.messages = repaired_messages;
+    memory
+        .save_session_async(session)
+        .await
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+    *previous_response_id = None;
+    store_previous_response_id(memory, manifest.model.provider.as_str(), session, None);
+
+    info!(
+        agent = %manifest.name,
+        session_id = %session.id,
+        estimated_tokens = estimated,
+        compacted_messages = result.compacted_count,
+        kept_messages = session.messages.len(),
+        "Live session compaction applied before LLM call"
+    );
+
+    Ok(true)
+}
 
 /// Agent lifecycle phase within the execution loop.
 /// Used for UX indicators (typing, reactions) without coupling to channel types.
@@ -451,6 +527,21 @@ pub async fn run_agent_loop(
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
 
+        let live_compacted = maybe_compact_live_session(
+            manifest,
+            session,
+            memory,
+            driver.clone(),
+            available_tools,
+            &system_prompt,
+            ctx_window,
+            &mut previous_response_id,
+        )
+        .await?;
+        if live_compacted {
+            messages = session.messages.clone();
+        }
+
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
         let recovery =
             recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
@@ -518,9 +609,10 @@ pub async fn run_agent_loop(
         // (e.g. Groq/Llama, DeepSeek emit `<function=name>{json}</function>` in text)
         if !provider_name.eq_ignore_ascii_case("codex")
             && matches!(
-            response.stop_reason,
-            StopReason::EndTurn | StopReason::StopSequence
-        ) && response.tool_calls.is_empty()
+                response.stop_reason,
+                StopReason::EndTurn | StopReason::StopSequence
+            )
+            && response.tool_calls.is_empty()
         {
             let recovered = recover_text_tool_calls(&response.text(), available_tools);
             if !recovered.is_empty() {
@@ -927,8 +1019,11 @@ pub async fn run_agent_loop(
 
                     // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
                     let content = truncate_tool_result_dynamic(&result.content, &context_budget);
-                    let outcome_warn =
-                        loop_guard.record_outcome(&tool_call.name, &tool_call.input, &result.content);
+                    let outcome_warn = loop_guard.record_outcome(
+                        &tool_call.name,
+                        &tool_call.input,
+                        &result.content,
+                    );
 
                     let mut final_content = content;
                     if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
@@ -1658,6 +1753,21 @@ pub async fn run_agent_loop_streaming(
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
 
+        let live_compacted = maybe_compact_live_session(
+            manifest,
+            session,
+            memory,
+            driver.clone(),
+            available_tools,
+            &system_prompt,
+            ctx_window,
+            &mut previous_response_id,
+        )
+        .await?;
+        if live_compacted {
+            messages = session.messages.clone();
+        }
+
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
         let recovery =
             recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
@@ -1743,9 +1853,10 @@ pub async fn run_agent_loop_streaming(
         // Recover tool calls output as text (streaming path)
         if !provider_name.eq_ignore_ascii_case("codex")
             && matches!(
-            response.stop_reason,
-            StopReason::EndTurn | StopReason::StopSequence
-        ) && response.tool_calls.is_empty()
+                response.stop_reason,
+                StopReason::EndTurn | StopReason::StopSequence
+            )
+            && response.tool_calls.is_empty()
         {
             let recovered = recover_text_tool_calls(&response.text(), available_tools);
             if !recovered.is_empty() {
@@ -2121,8 +2232,11 @@ pub async fn run_agent_loop_streaming(
 
                     // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
                     let content = truncate_tool_result_dynamic(&result.content, &context_budget);
-                    let outcome_warn =
-                        loop_guard.record_outcome(&tool_call.name, &tool_call.input, &result.content);
+                    let outcome_warn = loop_guard.record_outcome(
+                        &tool_call.name,
+                        &tool_call.input,
+                        &result.content,
+                    );
 
                     let mut final_content = content;
                     if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {

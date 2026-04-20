@@ -1478,17 +1478,18 @@ For **web search providers**, the validator checks:
 
 ## Related Configuration
 
-Some subsystems have their own configuration that is not part of `config.toml` but is worth noting:
+### Session Compaction
 
-### Session Compaction (runtime)
-
-Configured internally via `CompactionConfig` (not currently exposed in `config.toml`):
+Configured in `[compaction]`:
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `enabled` | `true` | Enable automatic session compaction. |
 | `threshold` | `80` | Compact when session message count exceeds this. |
 | `keep_recent` | `20` | Number of recent messages preserved verbatim after compaction. |
 | `max_summary_tokens` | `1024` | Maximum tokens for the LLM summary of compacted messages. |
+| `token_threshold_ratio` | `0.55` | Ratio of the model context window that triggers token-based compaction when no explicit limit is set. |
+| `auto_compact_token_limit` | `null` | Explicit token limit for auto-compaction, similar to Codex IDE/CLI behavior. |
 
 ### WASM Sandbox (runtime)
 
